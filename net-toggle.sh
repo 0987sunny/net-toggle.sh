@@ -1,15 +1,14 @@
-sudo tee /usr/local/bin/net-toggle >/dev/null <<'ZSH'
 #!/usr/bin/env zsh
 # net-toggle — unified network controller (zsh)
 # Commands:
-#   on       : bring networking up (Wi-Fi/Ethernet auto)
+#   on       : bring networking up (Wi-Fi/Ethernet auto). Clears persistent rfkill from secure-shutdown.
 #   off      : bring networking fully down (non-persistent by default; add --airgap for persistent Wi-Fi rfkill)
 #   status   : pretty status incl. link rate + 1s throughput sample; Tor service/proxy state
 #
 # Design:
 #   - Pure zsh (no bashisms), CLI-first, no GUI deps.
 #   - Prefers NetworkManager (nmcli); falls back to iwd or plain ip/dhcp.
-#   - Default is NON-PERSISTENT radio control so next boot “just works”.
+#   - Tailored to pair with a persistent-rfkill shutdown: `on` reverses it cleanly.
 #   - Aesthetic: banners, magenta rules, tidy tables, spinner, subtle emoji.
 
 set -Eeuo pipefail
@@ -76,7 +75,6 @@ sample_iface_mbps(){
   rx2=$(readf "/sys/class/net/$ifc/statistics/rx_bytes"); tx2=$(readf "/sys/class/net/$ifc/statistics/tx_bytes")
   local drx=$(( rx2 > rx1 ? rx2 - rx1 : 0 ))
   local dtx=$(( tx2 > tx1 ? tx2 - tx1 : 0 ))
-  # bytes/s -> Mb/s (approx; avoids bc)
   printf "%.1f %.1f\n" "$(( drx * 8 ))e-6" "$(( dtx * 8 ))e-6" 2>/dev/null
 }
 
@@ -90,15 +88,21 @@ tor_status(){
 
 list_ifaces(){ ip -o link show | awk -F': ' '$2!="lo"{print $2}'; }
 
+default_dev(){
+  ip route show default 2>/dev/null | awk '/default/ {print $5; exit}'
+}
+
 net_basics(){
-  local gw4 gw6 dns
+  local gw4 gw6 dns dev
   gw4="$(ip route show default 2>/dev/null | awk '/default/{print $3; exit}')"
   gw6="$(ip -6 route show default 2>/dev/null | awk '/default/{print $3; exit}')"
+  dev="$(default_dev || true)"
   if command -v resolvectl &>/dev/null; then
     dns="$(resolvectl dns 2>/dev/null | awk '{for(i=3;i<=NF;i++)printf (i>3?" ":"") $i} END{print ""}')"
   else
     dns="$(awk '/^nameserver/{printf (NR>1?", ":"") $2} END{print ""}' /etc/resolv.conf 2>/dev/null || true)"
   fi
+  kv "Default dev" "${dev:-—}"
   kv "Gateway(v4)" "${gw4:-—}"
   kv "Gateway(v6)" "${gw6:-—}"
   kv "DNS"         "${dns:-—}"
@@ -108,7 +112,7 @@ iface_info(){
   local ifc="$1"
   local type=""
   [[ "$ifc" == wl* || "$ifc" == wlan* ]] && type="wifi"
-  [[ -z "$type" ]] && type="ethernet"  # cheap heuristic; good enough for status
+  [[ -z "$type" ]] && type="ethernet"
   local ip4="$(ip -o -4 addr show "$ifc" 2>/dev/null | awk '{print $4}' | paste -sd ' ')"
   local ip6="$(ip -o -6 addr show "$ifc" 2>/dev/null | awk '{print $4}' | paste -sd ' ')"
   local state="$(ip -o link show "$ifc" | awk '{print $9}')"
@@ -143,7 +147,6 @@ nm_connect_wifi_preferred(){
     done
     return 1
   else
-    # Let NM autoconnect; nudge devices
     local d; for d in "${wifi_devs[@]}"; do nmcli dev connect "$d" 2>/dev/null || true; done
     sleep 1
     nmcli -t -f DEVICE,STATE dev | awk -F: '$2=="connected"{exit 1}'; local rc=$?
@@ -155,9 +158,9 @@ nm_up(){
   box "NetworkManager up"
   spin "Enabling NM networking…"  nmcli networking on || true
   spin "Restarting NetworkManager…" systemctl restart NetworkManager || true
-  spin "Ensuring Wi-Fi radio is allowed…" nmcli radio wifi on || true
+  spin "Ensuring radios allowed (Wi-Fi/WWAN) …" sh -c 'nmcli radio wifi on; nmcli radio wwan on' || true
 
-  # Ethernet first (autoconnect if profiles exist)
+  # Ethernet first
   info "Connecting Ethernet (if present)…"
   nmcli -t -f DEVICE,TYPE dev | awk -F: '$2=="ethernet"{print $1}' | while read -r e; do nmcli dev connect "$e" 2>/dev/null || true; done
 
@@ -167,7 +170,6 @@ nm_up(){
 
 nm_down(){
   box "NetworkManager down"
-  # Disconnect all devices (transient); turn NM networking off (non-persistent)
   local -a connd; connd=("${(@f)$(nmcli -t -f DEVICE,STATE dev | awk -F: '$2=="connected"{print $1}')}") || true
   if (( ${#connd} )); then
     info "Disconnecting: ${connd[*]}"
@@ -187,12 +189,14 @@ cmd_on(){
   kv "TTY"    "$(tty 2>/dev/null || echo n/a)"
   rule; print
 
-  # Clear persistent Wi-Fi block if some previous hard-airgap was used
+  # Reverse persistent air-gap from secure-shutdown
   if command -v rfkill &>/dev/null; then
-    spin "Clearing Wi-Fi rfkill (if any)…" rfkill unblock wifi || true
+    spin "Clearing persistent rfkill (wifi/wwan/bt)…" rfkill unblock all || true
   fi
 
   if command -v nmcli &>/dev/null; then
+    # Ensure NM radios are allowed in-session
+    sh -c 'nmcli radio all on' 2>/dev/null || true
     nm_up
   elif systemctl is-active --quiet iwd || systemctl is-enabled --quiet iwd 2>/dev/null; then
     box "iwd path (no NetworkManager)"
@@ -227,10 +231,22 @@ cmd_on(){
     done
   fi
 
+  # Quick connectivity sanity (noisy but useful)
+  box "Connectivity check"
+  local gw dev; dev="$(default_dev || true)"; gw="$(ip route show default | awk '/default/{print $3; exit}')"
+  [[ -n "$gw" ]] && (ping -W1 -c1 "$gw" &>/dev/null && ok "Ping gateway $gw (dev $dev)") || warn "Gateway ping skipped/failed"
+  (ping -W1 -c1 1.1.1.1 &>/dev/null && ok "Ping 1.1.1.1 OK") || warn "No ICMP to 1.1.1.1"
+  (getent hosts archlinux.org &>/dev/null && ok "DNS OK (archlinux.org)") || warn "DNS lookup failed (archlinux.org)"
+
   print; box "Basics"
   net_basics
   print; box "Interfaces"
   local ifc; for ifc in ${(f)"$(list_ifaces)"}; do iface_info "$ifc"; rule; done
+
+  if command -v nmcli &>/dev/null; then
+    box "Active NM connections"
+    nmcli -t -f NAME,TYPE,DEVICE connection show --active | awk -F: '{printf "    %-18s %-8s %s\n",$1,$2,$3}'
+  fi
   ok "Networking is up. 🚀"
 }
 
@@ -280,13 +296,16 @@ cmd_status(){
     box "NetworkManager"
     nmcli general status | sed 's/^/    /' || true
     print
+    box "Active NM connections"
+    nmcli -t -f NAME,TYPE,DEVICE connection show --active | awk -F: '{printf "    %-18s %-8s %s\n",$1,$2,$3}'
+    print
   fi
 
   box "Basics"
   net_basics
 
   box "Interfaces (with 1s throughput sample)"
-  local ifc rx tx lines
+  local ifc rx tx
   for ifc in ${(f)"$(list_ifaces)"}; do
     iface_info "$ifc"
     read rx tx < <(sample_iface_mbps "$ifc" || echo "0.0 0.0")
@@ -313,5 +332,3 @@ case "${1:-}" in
     exit 2
     ;;
 esac
-ZSH
-sudo chmod +x /usr/local/bin/net-toggle
