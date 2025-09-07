@@ -12,6 +12,9 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
+# Ensure width exists even under `set -u`
+: ${COLUMNS:=80}
+
 # -------- CONFIG --------
 typeset -a PREFERRED_SSIDS=(
   # "HomeSSID"
@@ -27,15 +30,17 @@ autoload -Uz colors && colors || true
 ok()   { print -P "%F{green}[✓]%f $*"; }
 warn() { print -P "%F{yellow}[!]%f $*"; }
 err()  { print -P "%F{red}[✗]%f $*" >&2; }
-info() { print -P "%F{cyan}[*]%f $*"; }  # use for section headers too
+info() { print -P "%F{cyan}[*]%f $*"; }  # section headers use this
 
-# Top banner only (purple rails + centered orange)
+# Top banner only (purple rails + centered orange), safe with missing $COLUMNS
 banner(){
   local h="$(hostname -s 2>/dev/null || echo archcrypt)"
   local d="$(date '+%Y-%m-%d %H:%M:%S %Z')"
-  print -P "%F{magenta}=====================================================%f"
+  local w="${COLUMNS:-80}"
   local msg="net-toggle — ${h} — ${d}"
-  local w=${COLUMNS:-80} pad=$(( (w - ${#msg}) / 2 )); (( pad < 0 )) && pad=0
+  local pad=$(( (w - ${#msg}) / 2 ))
+  (( pad < 0 )) && pad=0
+  print -P "%F{magenta}=====================================================%f"
   print -P "%F{yellow}$(printf "%*s%s" "$pad" "" "$msg")%f"
   print -P "%F{magenta}=====================================================%f"
 }
@@ -216,7 +221,6 @@ speedtest_all_up_ifaces(){
   info "Network speed"
   local ifc res dl ul used
   for ifc in $(up_ifaces); do
-    # require an IPv4 on the iface (most speed tools use v4)
     [[ -n "$(iface_ipv4 "$ifc")" ]] || continue
     used=""
     if command -v iperf3 &>/dev/null && [[ -n "${SPEEDTEST_IPERF_SERVER:-}" ]]; then
@@ -357,7 +361,7 @@ case "${1:-}" in
     print -P "%F{yellow}Usage:%f net-toggle {on|off|status}"
     print "  on     : NM-first bring-up (unblock radios, NM up, Ethernet→Wi-Fi)"
     print "  off    : ultra-secure: NM disconnect, links down, PERSISTENT rfkill (wifi/wwan/bt)"
-    print "  status : NM/Tor/RFKill + per-IFACE DNS + Internet speed per UP iface"
+    print "  status : NM/Tor/RFKill + per-IFACE DNS + Internet speed per UP iface (5s iperf3 when available)"
     exit 2
     ;;
 esac
