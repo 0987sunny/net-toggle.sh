@@ -1,8 +1,8 @@
 #!/usr/bin/env zsh
-# net-toggle — NM-first network controller + status (zsh)
+# net-toggle — NM-first network controller + full status (zsh)
 # on     : bring networking up via NetworkManager (Ethernet→Wi-Fi). Clears persistent rfkill.
 # off    : ultra-secure: NM disconnect, links down, PERSISTENT rfkill (wifi/wwan/bt). Then shows status.
-# status : pretty status (NM, basics, interfaces, per-IFACE speed) + Tor section if Tor is active.
+# status : pretty status (NM, basics, interfaces, per-IFACE Internet speed) + Tor section (only if active).
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -14,13 +14,13 @@ typeset -a PREFERRED_SSIDS=(
   # "HomeSSID"
   # "PhoneHotspot"
 )
-: ${SPEEDTEST_IPERF_SERVER:=iperf.he.net}
+: ${SPEEDTEST_IPERF_SERVER:=iperf.he.net}   # preferred backend for interface speed
 : ${SPEEDTEST_TIMEOUT_SEC:=30}
 
 # Tor speed test endpoints (used only if tor is active)
 : ${TOR_DL_URL:=https://speed.hetzner.de/100MB.bin}
 : ${TOR_UL_URL:=https://speed.hetzner.de/upload.php}
-: ${TOR_TEST_SECS:=5}
+: ${TOR_TEST_SECS:=5}                        # ~5s DL + ~5s UL over Tor
 
 # ------------ UI HELPERS ------------
 autoload -Uz colors && colors || true
@@ -239,8 +239,9 @@ _tor_speed_5s(){
   [[ -n "${dl:-}" || -n "${ul:-}" ]] || return 1
   printf "%s|%s" "${dl:-—}" "${ul:-—}"
 }
-tor_speed(){
-  if ! tor_active || ! socks_listening; then
+tor_section(){
+  info "Tor"
+  if ! tor_active; then
     printf "    %-18s %s\n" "Tor" "not active"
     return
   fi
@@ -251,9 +252,11 @@ tor_speed(){
   listening 9050 || true
   listening 9051 || true
   tor_check
-  local res dl ul; res=$(_tor_speed_5s || true)
-  if [[ -n "$res" ]]; then dl="${res%%|*}"; ul="${res##*|}"; printf "    %-18s ↓ %s Mb/s   ↑ %s Mb/s\n" "Tor speed" "$dl" "$ul"
-  else printf "    %-18s %s\n" "Tor speed" "test failed"; fi
+  if socks_listening; then
+    local res dl ul; res=$(_tor_speed_5s || true)
+    if [[ -n "$res" ]]; then dl="${res%%|*}"; ul="${res##*|}"; printf "    %-18s ↓ %s Mb/s   ↑ %s Mb/s\n" "Tor speed" "$dl" "$ul"
+    else printf "    %-18s %s\n" "Tor speed" "test failed"; fi
+  fi
 }
 
 # ------------ Commands ------------
@@ -284,12 +287,7 @@ cmd_status(){
 
   speedtest_all_up_ifaces
 
-  info "Tor"
-  if tor_active; then
-    tor_speed
-  else
-    printf "    %-18s %s\n" "Tor" "not active"
-  fi
+  tor_section
 
   ok "Status captured."
 }
@@ -372,7 +370,7 @@ case "${1:-}" in
     print -P "%F{yellow}Usage:%f net-toggle {on|off|status}"
     print "  on     : NM-first bring-up (unblock radios, NM up, Ethernet→Wi-Fi)"
     print "  off    : ultra-secure: NM disconnect, links down, PERSISTENT rfkill (wifi/wwan/bt)"
-    print "  status : full network details + per-IFACE speed; Tor section only if active"
+    print "  status : full network details + per-IFACE Internet speed; Tor section only if active"
     exit 2
     ;;
 esac
