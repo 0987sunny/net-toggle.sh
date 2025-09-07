@@ -2,10 +2,10 @@
 # net-toggle — unified network controller (zsh)
 # on     : bring networking up via NetworkManager (Ethernet→Wi-Fi). Reverses persistent rfkill.
 # off    : ultra-secure cut: disconnect + links down + PERSISTENT rfkill (wifi/wwan/bt). Prints status.
-# status : pretty status incl. link rate + 5s speed test avg (default iface); Tor + rfkill; per-iface DNS.
+# status : pretty status + per-iface DNS + Tor/RFKill + per-IFACE Internet speed test (5s avg with iperf3).
 #
 # Policy:
-#   - Always use NetworkManager if present. Start it; prefer it for Ethernet + Wi-Fi.
+#   - Always use NetworkManager if present (primary for Wi-Fi & Ethernet).
 #   - Fall back to iwd/minimal wired only if NM is missing.
 #   - Non-destructive; best-effort to mark devices managed and stop conflicting daemons.
 
@@ -17,9 +17,8 @@ typeset -a PREFERRED_SSIDS=(
   # "HomeSSID"
   # "PhoneHotspot"
 )
-: ${SPEEDTEST_IFACE:=}                  # force which iface to test (default: current default route dev)
-: ${SPEEDTEST_IPERF_SERVER:=iperf.he.net}  # public iperf3 server (can change)
-: ${SPEEDTEST_TIMEOUT_SEC:=30}          # cap for external tests (Ookla/cli/iperf3)
+: ${SPEEDTEST_IPERF_SERVER:=iperf.he.net}   # public iperf3 server; change if you prefer
+: ${SPEEDTEST_TIMEOUT_SEC:=30}              # cap for non-iperf testers (Ookla/cli)
 
 # -------- UI HELPERS --------
 autoload -Uz colors && colors || true
@@ -28,22 +27,18 @@ autoload -Uz colors && colors || true
 ok()   { print -P "%F{green}[✓]%f $*"; }
 warn() { print -P "%F{yellow}[!]%f $*"; }
 err()  { print -P "%F{red}[✗]%f $*" >&2; }
-info() { print -P "%F{cyan}[*]%f $*"; }
+info() { print -P "%F{cyan}[*]%f $*"; }  # use for section headers too
 
-rule()   { print -P "%F{magenta}─────────────────────────────────────────────────────%f"; }
-center_orange(){
-  local msg="$*"; local w=${COLUMNS:-80}; local pad=$(( (w - ${#msg}) / 2 ))
-  (( pad < 0 )) && pad=0
-  print -P "%F{yellow}$(printf "%*s%s" "$pad" "" "$msg")%f"
-}
+# Top banner only (purple rails + centered orange)
 banner(){
   local h="$(hostname -s 2>/dev/null || echo archcrypt)"
   local d="$(date '+%Y-%m-%d %H:%M:%S %Z')"
   print -P "%F{magenta}=====================================================%f"
-  center_orange "net-toggle — ${h} — ${d}"
+  local msg="net-toggle — ${h} — ${d}"
+  local w=${COLUMNS:-80} pad=$(( (w - ${#msg}) / 2 )); (( pad < 0 )) && pad=0
+  print -P "%F{yellow}$(printf "%*s%s" "$pad" "" "$msg")%f"
   print -P "%F{magenta}=====================================================%f"
 }
-box(){ rule; print -P "%F{yellow} $*%f"; rule; }  # left-aligned section header
 
 # swallow noisy output; one clean line
 step(){ local msg="$1"; shift; if "$@" &>/tmp/.nettoggle.step.log; then ok "$msg"; else warn "$msg (non-fatal)"; return 1; fi }
@@ -54,36 +49,16 @@ if [[ $EUID -ne 0 ]]; then exec sudo -E "$0" "$@"; fi
 # -------- COMMON UTILS --------
 readf(){ [[ -r "$1" ]] && <"$1" tr -d '\n' || echo 0; }
 list_ifaces(){ ip -o link show | awk -F': ' '$2!="lo"{print $2}'; }
+up_ifaces(){ for i in $(list_ifaces); do [[ "$(</sys/class/net/$i/operstate 2>/dev/null || echo down)" == up ]] && echo "$i"; done; }
+iface_ipv4(){
+  local ifc="$1"
+  ip -o -4 addr show "$ifc" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1
+}
 default_dev(){ ip route show default 2>/dev/null | awk '/default/ {print $5; exit}'; }
 
-# 5s local sample from /sys counters (Mb/s, 1 dec); only if iface is up
-sample_iface_avg_5s(){
-  local ifc="$1" dt=5 op rx1 tx1 rx2 tx2
-  op=$(</sys/class/net/"$ifc"/operstate 2>/dev/null || echo down)
-  [[ "$op" != "up" ]] && { printf "0.0 0.0\n"; return 0; }
-  rx1=$(readf "/sys/class/net/$ifc/statistics/rx_bytes")
-  tx1=$(readf "/sys/class/net/$ifc/statistics/tx_bytes")
-  sleep "$dt"
-  rx2=$(readf "/sys/class/net/$ifc/statistics/rx_bytes")
-  tx2=$(readf "/sys/class/net/$ifc/statistics/tx_bytes")
-  local drx=$(( rx2 - rx1 )); (( drx < 0 )) && drx=0
-  local dtx=$(( tx2 - tx1 )); (( dtx < 0 )) && dtx=0
-  local down=$(( (drx * 8.0) / (1000.0*1000.0*dt) ))
-  local up=$((   (dtx * 8.0) / (1000.0*1000.0*dt) ))
-  printf "%.1f %.1f\n" "$down" "$up"
-}
-
-net_basics(){
-  local gw4 gw6 dev
-  dev="$(default_dev || true)"
-  gw4="$(ip route show default 2>/dev/null | awk '/default/{print $3; exit}')"
-  gw6="$(ip -6 route show default 2>/dev/null | awk '/default/{print $3; exit}')"
-  printf "    %-18s %s\n" "Default dev" "${dev:-—}"
-  printf "    %-18s %s\n" "Gateway(v4)" "${gw4:-—}"
-  printf "    %-18s %s\n" "Gateway(v6)" "${gw6:-—}"
-
-  # Per-interface DNS (clean, one line per link)
-  print "    DNS"
+# Per-IFACE DNS (clean, one line per link)
+print_dns(){
+  info "DNS"
   if command -v resolvectl &>/dev/null; then
     resolvectl dns 2>/dev/null | awk '
       /^Global/ { print "      Global: " $3; next }
@@ -94,12 +69,23 @@ net_basics(){
   fi
 }
 
+net_basics(){
+  local gw4 gw6 dev
+  dev="$(default_dev || true)"
+  gw4="$(ip route show default 2>/dev/null | awk '/default/{print $3; exit}')"
+  gw6="$(ip -6 route show default 2>/dev/null | awk '/default/{print $3; exit}')"
+  printf "    %-18s %s\n" "Default dev" "${dev:-—}"
+  printf "    %-18s %s\n" "Gateway(v4)" "${gw4:-—}"
+  printf "    %-18s %s\n" "Gateway(v6)" "${gw6:-—}"
+  print_dns
+}
+
 iface_info(){
   local ifc="$1"
   local type="ethernet"; [[ "$ifc" == wl* || "$ifc" == wlan* ]] && type="wifi"
   local ip4 ip6 state ssid="" rate=""
-  ip4="$(ip -o -4 addr show "$ifc" 2>/dev/null | awk '{print $4}' | paste -sd ' ')"
-  ip6="$(ip -o -6 addr show "$ifc" 2>/dev/null | awk '{print $4}' | paste -sd ' ')"
+  ip4="$(ip -o -4 addr show "$ifc" 2>/dev/null | awk '{print $4}' | paste -sd ' ' | sed 's,/, ,g')"
+  ip6="$(ip -o -6 addr show "$ifc" 2>/dev/null | awk '{print $4}' | paste -sd ' ' | sed 's,/, ,g')"
   state="$(</sys/class/net/"$ifc"/operstate 2>/dev/null || echo down)"
   if [[ "$type" == "wifi" ]] && command -v nmcli &>/dev/null; then
     ssid="$(nmcli -t -f GENERAL.CONNECTION dev show "$ifc" 2>/dev/null | awk -F: '{print $2}')"
@@ -190,103 +176,109 @@ nm_disconnect_all(){
   step "Turning NM networking off" nmcli networking off
 }
 
-# ---------- 5s SPEED TEST (avg) ----------
-st_iperf3_5s(){
-  local face="$1" srv="$2" dl ul out
-  [[ -z "$srv" ]] && return 1
-  # Download (reverse), 5s
-  out=$(timeout ${SPEEDTEST_TIMEOUT_SEC}s iperf3 -J -R -t 5 -f m -c "$srv" 2>/dev/null || true)
-  dl=$(print -r -- "$out" | awk -F'[,: ]+' '/end.*sum_sent/ && /bits_per_second/ {printf "%.1f Mb/s", $NF/1e6; exit}')
-  # Upload, 5s
-  out=$(timeout ${SPEEDTEST_TIMEOUT_SEC}s iperf3 -J -t 5 -f m -c "$srv" 2>/dev/null || true)
-  ul=$(print -r -- "$out" | awk -F'[,: ]+' '/end.*sum_sent/ && /bits_per_second/ {printf "%.1f Mb/s", $NF/1e6; exit}')
+# ---------- Internet Speed Test (per IFACE) ----------
+# Preferred: iperf3 with 5-second windows, bound to IFACE IPv4 using -B
+st_iperf3_iface(){
+  local ifc="$1" srv="$2" ip dl ul out
+  ip="$(iface_ipv4 "$ifc")"; [[ -z "$ip" ]] && return 1
+  # Download (reverse)
+  out=$(timeout ${SPEEDTEST_TIMEOUT_SEC}s iperf3 -J -R -t 5 -f m -B "$ip" -c "$srv" 2>/dev/null || true)
+  dl=$(print -r -- "$out" | awk -F'[,: ]+' '/"end"/,0 {if($0 ~ /bits_per_second/){v=$NF}} END{if(v!="") printf "%.1f Mb/s", v/1e6}')
+  # Upload
+  out=$(timeout ${SPEEDTEST_TIMEOUT_SEC}s iperf3 -J -t 5 -f m -B "$ip" -c "$srv" 2>/dev/null || true)
+  ul=$(print -r -- "$out" | awk -F'[,: ]+' '/"end"/,0 {if($0 ~ /bits_per_second/){v=$NF}} END{if(v!="") printf "%.1f Mb/s", v/1e6}')
   [[ -n "$dl" || -n "$ul" ]] || return 1
   printf "%s|%s\n" "${dl:-—}" "${ul:-—}"
 }
 
-st_ookla(){
-  local out dl ul
-  out=$(timeout ${SPEEDTEST_TIMEOUT_SEC}s speedtest --accept-license --accept-gdpr 2>/dev/null | sed 's/\r/\n/g' || true)
+# Ookla fallback (can’t force 5s; binds to iface if supported)
+st_ookla_iface(){
+  local ifc="$1" out dl ul
+  out=$(timeout ${SPEEDTEST_TIMEOUT_SEC}s speedtest --accept-license --accept-gdpr --interface "$ifc" 2>/dev/null | sed 's/\r/\n/g' || true)
   dl=$(print -r -- "$out" | awk -F': *' '/^Download/ {print $2; exit}')
   ul=$(print -r -- "$out" | awk -F': *' '/^Upload/   {print $2; exit}')
   [[ -n "$dl" || -n "$ul" ]] || return 1
   printf "%s|%s\n" "${dl:-—}" "${ul:-—}"
 }
 
-st_cli(){
-  local out dl ul
-  out=$(timeout ${SPEEDTEST_TIMEOUT_SEC}s speedtest-cli --simple 2>/dev/null || true)
+# speedtest-cli fallback (bind by source IP)
+st_cli_iface(){
+  local ifc="$1" ip out dl ul
+  ip="$(iface_ipv4 "$ifc")"; [[ -z "$ip" ]] && return 1
+  out=$(timeout ${SPEEDTEST_TIMEOUT_SEC}s speedtest-cli --simple --source "$ip" 2>/dev/null || true)
   dl=$(print -r -- "$out" | awk '/^Download/{print $2" " $3; exit}')
   ul=$(print -r -- "$out" | awk '/^Upload/  {print $2" " $3; exit}')
   [[ -n "$dl" || -n "$ul" ]] || return 1
   printf "%s|%s\n" "${dl:-—}" "${ul:-—}"
 }
 
+speedtest_all_up_ifaces(){
+  info "Network speed"
+  local ifc res dl ul used
+  for ifc in $(up_ifaces); do
+    # require an IPv4 on the iface (most speed tools use v4)
+    [[ -n "$(iface_ipv4 "$ifc")" ]] || continue
+    used=""
+    if command -v iperf3 &>/dev/null && [[ -n "${SPEEDTEST_IPERF_SERVER:-}" ]]; then
+      res=$(st_iperf3_iface "$ifc" "$SPEEDTEST_IPERF_SERVER" || true)
+      [[ -n "$res" ]] && { dl="${res%%|*}"; ul="${res##*|}"; used="iperf3 (5s)"; }
+    fi
+    if [[ -z "$used" && -x "$(command -v speedtest || true)" ]]; then
+      res=$(st_ookla_iface "$ifc" || true)
+      [[ -n "$res" ]] && { dl="${res%%|*}"; ul="${res##*|}"; used="Ookla"; }
+    fi
+    if [[ -z "$used" && -x "$(command -v speedtest-cli || true)" ]]; then
+      res=$(st_cli_iface "$ifc" || true)
+      [[ -n "$res" ]] && { dl="${res%%|*}"; ul="${res##*|}"; used="speedtest-cli"; }
+    fi
+    if [[ -n "$used" ]]; then
+      printf "      %-16s ↓ %s   ↑ %s   [%s]\n" "$ifc" "${dl:-—}" "${ul:-—}" "$used"
+    else
+      printf "      %-16s %s\n" "$ifc" "No speed tool found (install iperf3 or speedtest)."
+    fi
+  done
+}
+
 # ---------- Commands ----------
 cmd_status(){
-  [[ "${1:-}" == "no-clear" ]] || { clear; banner; }
+  clear; banner
 
-  box "Overview"
+  info "Overview"
   printf "    %-18s %s\n" "User"   "${SUDO_USER:-$USER}"
   printf "    %-18s %s\n" "Kernel" "$(uname -r)"
   printf "    %-18s %s\n" "TTY"    "$(tty 2>/dev/null || echo n/a)"
 
   if command -v nmcli &>/dev/null; then
-    box "NetworkManager"
+    info "NetworkManager"
     nmcli general status | sed 's/^/    /' || true
     print
-    box "Active NM connections"
+    info "Active NM connections"
     nmcli -t -f NAME,TYPE,DEVICE connection show --active | awk -F: '{printf "    %-18s %-8s %s\n",$1,$2,$3}'
     print
   fi
 
-  box "Basics"
+  info "Basics"
   net_basics
 
-  box "Interfaces (5s speed avg on default iface)"
-  local def ifc rx tx st_dl="—" st_ul="—" tested=""
-  def="${SPEEDTEST_IFACE:-$(default_dev || true)}"
+  info "Interfaces"
+  local ifc
+  for ifc in $(list_ifaces); do iface_info "$ifc"; print; done
 
-  # If we can, run a 5s external speed test for the default iface (max-ish avg)
-  if [[ -n "$def" ]]; then
-    if command -v iperf3 &>/dev/null && [[ -n "${SPEEDTEST_IPERF_SERVER:-}" ]]; then
-      local r; r=$(st_iperf3_5s "$def" "$SPEEDTEST_IPERF_SERVER" || true)
-      [[ -n "$r" ]] && { st_dl="${r%%|*}"; st_ul="${r##*|}"; tested="iperf3 (5s)"; }
-    elif command -v speedtest &>/dev/null; then
-      local r; r=$(st_ookla || true)
-      [[ -n "$r" ]] && { st_dl="${r%%|*}"; st_ul="${r##*|}"; tested="Ookla"; }
-    elif command -v speedtest-cli &>/dev/null; then
-      local r; r=$(st_cli || true)
-      [[ -n "$r" ]] && { st_dl="${r%%|*}"; st_ul="${r##*|}"; tested="speedtest-cli"; }
-    fi
-  fi
-
-  for ifc in ${(f)"$(list_ifaces)"}; do
-    iface_info "$ifc"
-
-    if [[ "$ifc" == "$def" ]]; then
-      if [[ "$tested" != "" ]]; then
-        printf "    %-18s %s   %s\n" "Speed test avg" "↓ ${st_dl}   ↑ ${st_ul}" "[$tested]"
-      else
-        read rx tx < <(sample_iface_avg_5s "$ifc" || echo "0.0 0.0")
-        printf "    %-18s ↓ %s Mb/s   ↑ %s Mb/s   %s\n" "5s sample" "$rx" "$tx" "[local counters, not max]"
-      fi
-    fi
-    rule
-  done
-
-  box "Tor"
+  info "Tor"
   tor_status
 
-  box "RFKill"
+  info "RFKill"
   rfkill_summary
+
+  speedtest_all_up_ifaces
 
   ok "Status captured. 📊"
 }
 
 cmd_on(){
   clear; banner
-  box "Overview"
+
+  info "Overview"
   printf "    %-18s %s\n" "User"   "${SUDO_USER:-$USER}"
   printf "    %-18s %s\n" "Kernel" "$(uname -r)"
   printf "    %-18s %s\n" "TTY"    "$(tty 2>/dev/null || echo n/a)"
@@ -296,7 +288,7 @@ cmd_on(){
   if command -v nmcli &>/dev/null; then
     nm_connect
   elif systemctl is-active --quiet iwd || systemctl is-enabled --quiet iwd 2>/dev/null; then
-    box "iwd path (no NetworkManager)"
+    info "iwd path (no NetworkManager)"
     step "Restarting iwd" systemctl restart iwd
     typeset -a WLANS; WLANS=("${(@f)$(ls /sys/class/net | grep -E '^wl|^wlan' || true)}")
     if (( ${#WLANS} )); then
@@ -316,9 +308,9 @@ cmd_on(){
       warn "No wlan* interface found."
     fi
   else
-    box "Minimal wired fallback"
+    info "Minimal wired fallback"
     info "Bringing non-loopback links up…"
-    local dev; for dev in ${(f)"$(list_ifaces)"}; do ip link set "$dev" up &>/dev/null || true; done
+    local dev; for dev in $(list_ifaces); do ip link set "$dev" up &>/dev/null || true; done
     info "Attempting DHCP on common wired names…"
     for dev in eth0 eno1 enp0s25 enp3s0 enp2s0; do
       command -v dhcpcd &>/dev/null && dhcpcd -n "$dev" &>/dev/null || true
@@ -326,7 +318,7 @@ cmd_on(){
     done
   fi
 
-  box "Connectivity check"
+  info "Connectivity check"
   local gw dev; dev="$(default_dev || true)"; gw="$(ip route show default | awk '/default/{print $3; exit}')"
   [[ -n "$gw" ]] && (ping -W1 -c1 "$gw" &>/dev/null && ok "Ping gateway $gw (dev $dev)") || warn "Gateway ping skipped/failed"
   (ping -W1 -c1 1.1.1.1 &>/dev/null && ok "Ping 1.1.1.1 OK") || warn "No ICMP to 1.1.1.1"
@@ -337,14 +329,14 @@ cmd_on(){
 
 cmd_off(){
   clear; banner
-  box "Ultra-secure teardown"
 
+  info "Ultra-secure teardown"
   if command -v nmcli &>/dev/null; then
     nm_disconnect_all
   fi
 
   info "Bringing non-loopback links down…"
-  local dev; for dev in ${(f)"$(list_ifaces)"}; do ip link set "$dev" down &>/dev/null || true; done
+  local dev; for dev in $(list_ifaces); do ip link set "$dev" down &>/dev/null || true; done
 
   if command -v rfkill &>/dev/null; then
     step "Applying persistent rfkill (wifi/wwan/bt)" sh -c 'rfkill block wifi; rfkill block wwan; rfkill block bluetooth'
@@ -365,7 +357,7 @@ case "${1:-}" in
     print -P "%F{yellow}Usage:%f net-toggle {on|off|status}"
     print "  on     : NM-first bring-up (unblock radios, NM up, Ethernet→Wi-Fi)"
     print "  off    : ultra-secure: NM disconnect, links down, PERSISTENT rfkill (wifi/wwan/bt)"
-    print "  status : show NM/Tor/RFKill + per-iface DNS + 5s speed avg (default iface)"
+    print "  status : NM/Tor/RFKill + per-IFACE DNS + Internet speed per UP iface"
     exit 2
     ;;
 esac
