@@ -1,8 +1,10 @@
 #!/usr/bin/env zsh
+# v 1.0
 # net-toggle — NM-first network controller + full status (zsh)
 # on     : bring networking up via NetworkManager (Ethernet→Wi-Fi). Clears persistent rfkill.
 # off    : ultra-secure: NM disconnect, links down, PERSISTENT rfkill (wifi/wwan/bt). Then shows status.
 # status : pretty status (NM, basics, interfaces, per-IFACE Internet speed) + Tor section (only if active).
+SCRIPT_VER="2025-09-07.3"
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -180,7 +182,6 @@ st_cli_iface(){
   printf "%s|%s\n" "${dl:-—}" "${ul:-—}"
 }
 speedtest_all_up_ifaces(){
-  info "Network speed"
   local ifc res dl ul used listed=0
   for ifc in $(up_ifaces); do
     [[ -n "$(iface_ipv4 "$ifc")" ]] || continue
@@ -240,7 +241,6 @@ _tor_speed_5s(){
   printf "%s|%s" "${dl:-—}" "${ul:-—}"
 }
 tor_section(){
-  info "Tor"
   if ! tor_active; then
     printf "    %-18s %s\n" "Tor" "not active"
     return
@@ -269,6 +269,7 @@ cmd_status(){
   printf "    %-18s %s\n" "User"   "${SUDO_USER:-$USER}"
   printf "    %-18s %s\n" "Kernel" "$(uname -r)"
   printf "    %-18s %s\n" "TTY"    "$(tty 2>/dev/null || echo n/a)"
+  printf "    %-18s %s\n" "Version" "${SCRIPT_VER}"
 
   if command -v nmcli &>/dev/null; then
     info "NetworkManager"
@@ -285,8 +286,14 @@ cmd_status(){
   info "Interfaces"
   local ifc; for ifc in $(list_ifaces); do iface_info "$ifc"; print; done
 
-  speedtest_all_up_ifaces
+  info "Network speed"
+  if [[ -z "$(up_ifaces)" ]]; then
+    printf "      %s\n" "No UP interfaces — skipping."
+  else
+    speedtest_all_up_ifaces
+  fi
 
+  info "Tor"
   tor_section
 
   ok "Status captured."
