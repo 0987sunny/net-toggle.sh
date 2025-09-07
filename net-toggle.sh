@@ -1,4 +1,3 @@
-sudo tee /usr/local/bin/net-toggle >/dev/null <<'ZSH'
 #!/usr/bin/env zsh
 # net-toggle — unified network controller (zsh)
 # on     : bring networking up via NetworkManager (Ethernet→Wi-Fi). Reverses persistent rfkill.
