@@ -1,29 +1,28 @@
 #!/usr/bin/env zsh
-# tor-toggle — start/stop/status for system Tor (zsh)
-# on     : start/enable tor.service (re-exec with sudo only for this)
-# off    : stop tor.service (re-exec with sudo only for this)
-# status : read-only overview with Tor exit check + Tor network speed (no sudo)
+# net-toggle — NM-first network controller + status (zsh)
+# on     : bring networking up via NetworkManager (Ethernet→Wi-Fi). Clears persistent rfkill.
+# off    : ultra-secure: NM disconnect, links down, PERSISTENT rfkill (wifi/wwan/bt). Then shows status.
+# status : pretty status (NM, basics, interfaces, per-IFACE speed) + Tor section if Tor is active.
 
 set -Eeuo pipefail
 IFS=$'\n\t'
 
 : ${COLUMNS:=80}
-: ${TOR_DL_URL:=https://speed.hetzner.de/100MB.bin}  # large enough; we stop at ~5s
-: ${TOR_UL_URL:=https://speed.hetzner.de/upload.php} # accepts POST bodies
-: ${TOR_TEST_SECS:=5}                                 # target duration for each leg
 
-# -------- Runtime/state dir (root vs user) --------
-if [[ $EUID -eq 0 ]]; then
-  STATE_DIR="/run/tor-toggle"
-else
-  STATE_DIR="${XDG_RUNTIME_DIR:-/run/user/$UID}/tor-toggle"
-fi
-ensure_state_dir() {
-  mkdir -p "$STATE_DIR" 2>/dev/null || true
-  [[ $EUID -eq 0 ]] && chmod 700 "$STATE_DIR" || true
-}
+# ------------ CONFIG ------------
+typeset -a PREFERRED_SSIDS=(
+  # "HomeSSID"
+  # "PhoneHotspot"
+)
+: ${SPEEDTEST_IPERF_SERVER:=iperf.he.net}
+: ${SPEEDTEST_TIMEOUT_SEC:=30}
 
-# -------- UI helpers --------
+# Tor speed test endpoints (used only if tor is active)
+: ${TOR_DL_URL:=https://speed.hetzner.de/100MB.bin}
+: ${TOR_UL_URL:=https://speed.hetzner.de/upload.php}
+: ${TOR_TEST_SECS:=5}
+
+# ------------ UI HELPERS ------------
 autoload -Uz colors && colors || true
 : ${TERM:="xterm-256color"}
 
@@ -32,156 +31,337 @@ warn() { print -P "%F{yellow}[!]%f $*"; }
 err()  { print -P "%F{red}[✗]%f $*" >&2; }
 info() { print -P "%F{cyan}[*]%f $*"; }
 
+# Top banner: purple rails; orange title LEFT-aligned
 banner(){
   local h="$(hostname -s 2>/dev/null || echo archcrypt)"
   local d="$(date '+%Y-%m-%d %H:%M:%S %Z')"
-  local w="${COLUMNS:-80}"
-  local msg="tor-toggle — ${h} — ${d}"
-  local pad=$(( (w - ${#msg}) / 2 )); (( pad < 0 )) && pad=0
   print -P "%F{magenta}=====================================================%f"
-  print -P "%F{yellow}$(printf "%*s%s" "$pad" "" "$msg")%f"
+  print -P "%F{yellow}net-toggle — ${h} — ${d}%f"
   print -P "%F{magenta}=====================================================%f"
 }
 
-step(){ local msg="$1"; shift; if "$@" &>/tmp/.tortoggle.step.log; then ok "$msg"; else warn "$msg (non-fatal)"; return 1; fi }
+# show one clean line for a noisy step
+step(){ local msg="$1"; shift; if "$@" &>/tmp/.nettoggle.step.log; then ok "$msg"; else warn "$msg (non-fatal)"; return 1; fi }
 
-# -------- Small helpers --------
+# ------------ ROOT RE-EXEC ------------
+if [[ $EUID -ne 0 ]]; then exec sudo -E "$0" "$@"; fi
+
+# ------------ COMMON ------------
+readf(){ [[ -r "$1" ]] && <"$1" tr -d '\n' || echo 0; }
+list_ifaces(){ ip -o link show | awk -F': ' '$2!="lo"{print $2}'; }
+up_ifaces(){ for i in $(list_ifaces); do [[ "$(</sys/class/net/$i/operstate 2>/dev/null || echo down)" == up ]] && echo "$i"; done; }
+iface_ipv4(){ ip -o -4 addr show "$1" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1; }
+default_dev(){ ip route show default 2>/dev/null | awk '/default/ {print $5; exit}'; }
+
+# DNS per link (each on its own line)
+print_dns(){
+  info "DNS"
+  if command -v resolvectl &>/dev/null; then
+    resolvectl dns 2>/dev/null | awk '
+      /^Global/ { print "      Global: " $3; next }
+      /^Link/   { iface=$3; sub(/\(|\)/,"",iface); ns=""; for(i=4;i<=NF;i++) ns=ns ? ns " " $i : $i; print "      " iface ": " ns }
+    '
+  else
+    awk '/^nameserver/{print "      resolv.conf: " $2}' /etc/resolv.conf 2>/dev/null || true
+  fi
+}
+
+net_basics(){
+  local gw4 gw6 dev
+  dev="$(default_dev || true)"
+  gw4="$(ip route show default 2>/dev/null | awk '/default/{print $3; exit}')"
+  gw6="$(ip -6 route show default 2>/dev/null | awk '/default/{print $3; exit}')"
+  printf "    %-18s %s\n" "Default dev" "${dev:-—}"
+  printf "    %-18s %s\n" "Gateway(v4)" "${gw4:-—}"
+  printf "    %-18s %s\n" "Gateway(v6)" "${gw6:-—}"
+  print_dns
+}
+
+iface_info(){
+  local ifc="$1"
+  local type="ethernet"; [[ "$ifc" == wl* || "$ifc" == wlan* ]] && type="wifi"
+  local ip4 ip6 state ssid="" rate=""
+  ip4="$(ip -o -4 addr show "$ifc" 2>/dev/null | awk '{print $4}' | paste -sd ' ' | sed 's,/, ,g')"
+  ip6="$(ip -o -6 addr show "$ifc" 2>/dev/null | awk '{print $4}' | paste -sd ' ' | sed 's,/, ,g')"
+  state="$(</sys/class/net/"$ifc"/operstate 2>/dev/null || echo down)"
+  if [[ "$type" == "wifi" ]] && command -v nmcli &>/dev/null; then
+    ssid="$(nmcli -t -f GENERAL.CONNECTION dev show "$ifc" 2>/dev/null | awk -F: '{print $2}')"
+    rate="$(nmcli -t -f WIFI.BITRATE dev show "$ifc" 2>/dev/null | awk -F: '{print $2}')"
+  fi
+  [[ -z "$rate" ]] && rate="$(iw dev "$ifc" link 2>/dev/null | awk -F': ' '/tx bitrate/ {print $2 " (iw)"}')"
+  if [[ "$type" == "ethernet" && -r /sys/class/net/$ifc/speed ]]; then
+    local es="$(</sys/class/net/$ifc/speed 2>/dev/null || true)"
+    [[ -n "$es" && "$es" != "-1" ]] && rate="${rate:+$rate, }${es} Mb/s"
+  fi
+  printf "    %-18s %s\n" "Interface" "$ifc (${type})"
+  printf "    %-18s %s\n" "State"     "$state"
+  [[ -n "$ssid" ]] && printf "    %-18s %s\n" "SSID" "$ssid"
+  [[ -n "$rate" ]] && printf "    %-18s %s\n" "Link rate" "$rate"
+  printf "    %-18s %s\n" "IPv4"      "${ip4:-—}"
+  printf "    %-18s %s\n" "IPv6"      "${ip6:-—}"
+}
+
+# ------------ NetworkManager helpers ------------
+nm_make_primary(){
+  systemctl is-active --quiet iwd            && step "Stopping iwd (use NM for Wi-Fi)" systemctl stop iwd || true
+  systemctl is-active --quiet wpa_supplicant && step "Stopping wpa_supplicant (use NM)" systemctl stop wpa_supplicant || true
+  step "Starting NetworkManager" systemctl start NetworkManager
+  step "Enabling NM networking"  nmcli networking on
+  step "Allowing radios (Wi-Fi/WWAN)"  sh -c 'nmcli radio wifi on; nmcli radio wwan on'
+}
+nm_fix_unmanaged(){
+  local -a unmanaged; unmanaged=("${(@f)$(nmcli -t -f DEVICE,STATE dev 2>/dev/null | awk -F: '$2=="unmanaged"{print $1}')}") || true
+  (( ${#unmanaged} )) || return 0
+  info "Fixing unmanaged devices: ${unmanaged[*]}"
+  local d; for d in "${unmanaged[@]}"; do nmcli device set "$d" managed yes &>/dev/null || true; done
+  sleep 1
+}
+nm_connect(){
+  nm_make_primary
+  nm_fix_unmanaged
+  info "Connecting Ethernet (if present)…"
+  nmcli -t -f DEVICE,TYPE dev | awk -F: '$2=="ethernet"{print $1}' |
+    while read -r e; do nmcli dev connect "$e" &>/dev/null || true; done
+  local -a wifi_devs; wifi_devs=("${(@f)$(nmcli -t -f DEVICE,TYPE dev | awk -F: '$2=="wifi"{print $1}')}") || true
+  if (( ${#wifi_devs} )); then
+    nmcli dev wifi rescan &>/dev/null || true
+    if (( ${#PREFERRED_SSIDS} )); then
+      local ssid
+      for ssid in "${PREFERRED_SSIDS[@]}"; do
+        info "Trying SSID: $ssid"
+        if nmcli -t -f NAME,TYPE connection show | awk -F: '$2=="wifi"{print $1}' | grep -Fxq "$ssid"; then
+          nmcli connection up id "$ssid" &>/dev/null && { ok "Connected: $ssid"; break; }
+        fi
+        nmcli dev wifi connect "$ssid" &>/dev/null && { ok "Connected: $ssid"; break; }
+      done
+    else
+      local d; for d in "${wifi_devs[@]}"; do nmcli dev connect "$d" &>/dev/null || true; done
+    fi
+  fi
+}
+nm_disconnect_all(){
+  local -a connd; connd=("${(@f)$(nmcli -t -f DEVICE,STATE dev 2>/dev/null | awk -F: '$2=="connected"{print $1}')}") || true
+  if (( ${#connd} )); then
+    info "Disconnecting: ${connd[*]}"
+    local d; for d in "${connd[@]}"; do nmcli dev disconnect "$d" &>/dev/null || true; done
+  else
+    info "No connected devices."
+  fi
+  step "Turning NM networking off" nmcli networking off
+}
+
+# ------------ Internet speed per UP interface ------------
+# iperf3 preferred (5s each direction, bound to iface IP); then Ookla; then speedtest-cli.
+st_iperf3_iface(){
+  local ifc="$1" srv="$2" ip dl ul out
+  ip="$(iface_ipv4 "$ifc")"; [[ -z "$ip" ]] && return 1
+  out=$(timeout ${SPEEDTEST_TIMEOUT_SEC}s iperf3 -J -R -t 5 -f m -B "$ip" -c "$srv" 2>/dev/null || true)
+  dl=$(print -r -- "$out" | awk -F'[,: ]+' '/"end"/,0 {if($0 ~ /bits_per_second/){v=$NF}} END{if(v!="") printf "%.1f Mb/s", v/1e6}')
+  out=$(timeout ${SPEEDTEST_TIMEOUT_SEC}s iperf3 -J    -t 5 -f m -B "$ip" -c "$srv" 2>/dev/null || true)
+  ul=$(print -r -- "$out" | awk -F'[,: ]+' '/"end"/,0 {if($0 ~ /bits_per_second/){v=$NF}} END{if(v!="") printf "%.1f Mb/s", v/1e6}')
+  [[ -n "$dl" || -n "$ul" ]] || return 1
+  printf "%s|%s\n" "${dl:-—}" "${ul:-—}"
+}
+st_ookla_iface(){
+  local ifc="$1" out dl ul
+  out=$(timeout ${SPEEDTEST_TIMEOUT_SEC}s speedtest --accept-license --accept-gdpr --interface "$ifc" 2>/dev/null | sed 's/\r/\n/g' || true)
+  dl=$(print -r -- "$out" | awk -F': *' '/^Download/ {print $2; exit}')
+  ul=$(print -r -- "$out" | awk -F': *' '/^Upload/   {print $2; exit}')
+  [[ -n "$dl" || -n "$ul" ]] || return 1
+  printf "%s|%s\n" "${dl:-—}" "${ul:-—}"
+}
+st_cli_iface(){
+  local ifc="$1" ip out dl ul
+  ip="$(iface_ipv4 "$ifc")"; [[ -z "$ip" ]] && return 1
+  out=$(timeout ${SPEEDTEST_TIMEOUT_SEC}s speedtest-cli --simple --source "$ip" 2>/dev/null || true)
+  dl=$(print -r -- "$out" | awk '/^Download/{print $2" " $3; exit}')
+  ul=$(print -r -- "$out" | awk '/^Upload/  {print $2" " $3; exit}')
+  [[ -n "$dl" || -n "$ul" ]] || return 1
+  printf "%s|%s\n" "${dl:-—}" "${ul:-—}"
+}
+speedtest_all_up_ifaces(){
+  info "Network speed"
+  local ifc res dl ul used listed=0
+  for ifc in $(up_ifaces); do
+    [[ -n "$(iface_ipv4 "$ifc")" ]] || continue
+    used=""
+    if command -v iperf3 &>/dev/null && [[ -n "${SPEEDTEST_IPERF_SERVER:-}" ]]; then
+      res=$(st_iperf3_iface "$ifc" "$SPEEDTEST_IPERF_SERVER" || true)
+      [[ -n "$res" ]] && { dl="${res%%|*}"; ul="${res##*|}"; used="iperf3 (5s)"; }
+    fi
+    if [[ -z "$used" && -x "$(command -v speedtest || true)" ]]; then
+      res=$(st_ookla_iface "$ifc" || true)
+      [[ -n "$res" ]] && { dl="${res%%|*}"; ul="${res##*|}"; used="Ookla"; }
+    fi
+    if [[ -z "$used" && -x "$(command -v speedtest-cli || true)" ]]; then
+      res=$(st_cli_iface "$ifc" || true)
+      [[ -n "$res" ]] && { dl="${res%%|*}"; ul="${res##*|}"; used="speedtest-cli"; }
+    fi
+    if [[ -n "$used" ]]; then
+      printf "      %-16s ↓ %s   ↑ %s   [%s]\n" "$ifc" "${dl:-—}" "${ul:-—}" "$used"
+      listed=1
+    fi
+  done
+  (( listed )) || printf "      %s\n" "No speed tool found (install iperf3 or speedtest)."
+}
+
+# ------------ Tor helpers (only used if Tor is active) ------------
 tor_active(){ systemctl is-active --quiet tor; }
 tor_enabled(){ systemctl is-enabled --quiet tor 2>/dev/null; }
 socks_listening(){ ss -lnH 'sport = :9050' 2>/dev/null | grep -q .; }
 listening(){ ss -lnH "sport = :$1" 2>/dev/null | awk '{print "    "$1,$4}'; }
-proxy_env_summary(){
-  local p="none"
-  [[ -n "${http_proxy:-}${HTTP_PROXY:-}${https_proxy:-}${HTTPS_PROXY:-}${all_proxy:-}${ALL_PROXY:-}" ]] && p="env-proxy"
-  printf "    %-18s %s\n" "Proxy env" "$p"
-}
 tor_check(){
   if ! command -v curl &>/dev/null; then
     printf "    %-18s %s\n" "Tor check" "curl not installed"
     return
   fi
-  local out
-  out=$(timeout 8s curl -s --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip 2>/dev/null) || true
-  if [[ -z "$out" ]]; then
-    printf "    %-18s %s\n" "Tor check" "no response"
-    return
-  fi
+  local out; out=$(timeout 8s curl -s --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip 2>/dev/null) || true
+  if [[ -z "$out" ]]; then printf "    %-18s %s\n" "Tor check" "no response"; return; fi
   local is_tor ip
   is_tor=$(printf "%s" "$out" | grep -o '"IsTor":[^,]*' | grep -q true && echo true || echo false)
   ip=$(printf "%s" "$out" | grep -o '"IP":"[^"]*"' | cut -d\" -f4)
   printf "    %-18s %s (IP: %s)\n" "Tor check" "$is_tor" "${ip:-?}"
 }
-
-# ---- Tor network speed (5s download + 5s upload via SOCKS) ----
-# Returns "dl|ul" in Mb/s (one decimal) or empty on failure.
 _tor_speed_5s(){
   command -v curl &>/dev/null || return 1
-  socks=(--socks5-hostname 127.0.0.1:9050)
-
-  # Download leg (~5s)
-  # We let curl run with --max-time slightly above target to cover TLS; compute actual time_total.
-  local w_dl bytes_dl t_dl
-  w_dl=$(curl -sS "${socks[@]}" -o /dev/null --max-time $((TOR_TEST_SECS+2)) \
-         -w '%{size_download} %{time_total}' "$TOR_DL_URL" 2>/dev/null) || w_dl=""
+  local w_dl bytes_dl t_dl w_ul bytes_ul t_ul dl ul
+  w_dl=$(curl -sS --socks5-hostname 127.0.0.1:9050 -o /dev/null --max-time $((TOR_TEST_SECS+2)) \
+         -w '%{size_download} %{time_total}' "$TOR_DL_URL" 2>/dev/null) || true
   bytes_dl=$(cut -d' ' -f1 <<<"$w_dl" 2>/dev/null || echo 0)
   t_dl=$(cut -d' ' -f2 <<<"$w_dl" 2>/dev/null || echo 0)
-
-  # Upload leg (~5s) — POST random bytes, server discards the body.
-  # Generate data stream for ~8MB; --max-time clips it to ~5–7s.
-  local w_ul bytes_ul t_ul
   w_ul=$(head -c 8388608 /dev/urandom | \
-        curl -sS "${socks[@]}" -X POST --data-binary @- --max-time $((TOR_TEST_SECS+2)) \
-             -o /dev/null -w '%{size_upload} %{time_total}' "$TOR_UL_URL" 2>/dev/null) || w_ul=""
+        curl -sS --socks5-hostname 127.0.0.1:9050 -X POST --data-binary @- --max-time $((TOR_TEST_SECS+2)) \
+             -o /dev/null -w '%{size_upload} %{time_total}' "$TOR_UL_URL" 2>/dev/null) || true
   bytes_ul=$(cut -d' ' -f1 <<<"$w_ul" 2>/dev/null || echo 0)
   t_ul=$(cut -d' ' -f2 <<<"$w_ul" 2>/dev/null || echo 0)
-
-  # Avoid divide-by-zero; compute Mb/s (bits / 1e6 / seconds)
-  local dl ul
-  if [[ "$bytes_dl" -gt 0 && "$t_dl" != "0" ]]; then
-    dl=$(awk -v b="$bytes_dl" -v t="$t_dl" 'BEGIN{printf "%.1f", (b*8)/(t*1000000)}')
-  fi
-  if [[ "$bytes_ul" -gt 0 && "$t_ul" != "0" ]]; then
-    ul=$(awk -v b="$bytes_ul" -v t="$t_ul" 'BEGIN{printf "%.1f", (b*8)/(t*1000000)}')
-  fi
+  if [[ "$bytes_dl" -gt 0 && "$t_dl" != "0" ]]; then dl=$(awk -v b="$bytes_dl" -v t="$t_dl" 'BEGIN{printf "%.1f", (b*8)/(t*1e6)}'); fi
+  if [[ "$bytes_ul" -gt 0 && "$t_ul" != "0" ]]; then ul=$(awk -v b="$bytes_ul" -v t="$t_ul" 'BEGIN{printf "%.1f", (b*8)/(t*1e6)}'); fi
   [[ -n "${dl:-}" || -n "${ul:-}" ]] || return 1
   printf "%s|%s" "${dl:-—}" "${ul:-—}"
 }
-
 tor_speed(){
-  info "Tor network speed"
   if ! tor_active || ! socks_listening; then
-    printf "    %-18s %s\n" "Speed" "Tor inactive — skipping"
+    printf "    %-18s %s\n" "Tor" "not active"
     return
   fi
-  if ! command -v curl &>/dev/null; then
-    printf "    %-18s %s\n" "Speed" "curl not installed"
-    return
-  fi
-  local res dl ul
-  res=$(_tor_speed_5s || true)
-  if [[ -z "$res" ]]; then
-    printf "    %-18s %s\n" "Speed" "test failed"
-    return
-  fi
-  dl="${res%%|*}"; ul="${res##*|}"
-  printf "    %-18s ↓ %s Mb/s   ↑ %s Mb/s\n" "Speed" "$dl" "$ul"
+  printf "    %-18s %s\n" "Tor" "active"
+  printf "    %-18s %s\n" "Enabled" "$(tor_enabled && echo enabled || echo disabled)"
+  printf "    %-18s %s\n" "SOCKS"   "127.0.0.1:9050"
+  printf "    %-18s %s\n" "Control" "127.0.0.1:9051"
+  listening 9050 || true
+  listening 9051 || true
+  tor_check
+  local res dl ul; res=$(_tor_speed_5s || true)
+  if [[ -n "$res" ]]; then dl="${res%%|*}"; ul="${res##*|}"; printf "    %-18s ↓ %s Mb/s   ↑ %s Mb/s\n" "Tor speed" "$dl" "$ul"
+  else printf "    %-18s %s\n" "Tor speed" "test failed"; fi
 }
 
-# -------- Commands --------
+# ------------ Commands ------------
 cmd_status(){
   clear; banner
+  print -P "%F{green}[i]%f archcrypt Network Details -"
+  print
 
   info "Overview"
   printf "    %-18s %s\n" "User"   "${SUDO_USER:-$USER}"
   printf "    %-18s %s\n" "Kernel" "$(uname -r)"
   printf "    %-18s %s\n" "TTY"    "$(tty 2>/dev/null || echo n/a)"
 
-  info "Tor service"
-  printf "    %-18s %s\n" "Active"  "$(tor_active && echo active || echo inactive)"
-  printf "    %-18s %s\n" "Enabled" "$(tor_enabled && echo enabled || echo disabled)"
-  printf "    %-18s %s\n" "SOCKS"   "127.0.0.1:9050"
-  printf "    %-18s %s\n" "Control" "127.0.0.1:9051"
-  listening 9050 || true
-  listening 9051 || true
-
-  info "Environment"
-  proxy_env_summary
-  tor_check
-
-  tor_speed
-
-  info "State dir"
-  if [[ -d "$STATE_DIR" ]]; then
-    printf "    %-18s %s\n" "Path" "$STATE_DIR"
-    [[ -f "$STATE_DIR/last" ]] && printf "    %-18s %s\n" "Last action" "$(cat "$STATE_DIR/last" 2>/dev/null || true)"
-  else
-    printf "    %-18s %s\n" "Path" "$STATE_DIR (not created)"
+  if command -v nmcli &>/dev/null; then
+    info "NetworkManager"
+    nmcli general status | sed 's/^/    /' || true
+    print
+    info "Active NM connections"
+    nmcli -t -f NAME,TYPE,DEVICE connection show --active | awk -F: '{printf "    %-18s %-8s %s\n",$1,$2,$3}'
+    print
   fi
 
-  ok "Status captured. 📊"
+  info "Basics"
+  net_basics
+
+  info "Interfaces"
+  local ifc; for ifc in $(list_ifaces); do iface_info "$ifc"; print; done
+
+  speedtest_all_up_ifaces
+
+  info "Tor"
+  if tor_active; then
+    tor_speed
+  else
+    printf "    %-18s %s\n" "Tor" "not active"
+  fi
+
+  ok "Status captured."
 }
 
 cmd_on(){
-  if [[ $EUID -ne 0 ]]; then exec sudo -E "$0" on; fi
   clear; banner
-  info "Starting Tor"
-  ensure_state_dir
-  step "Enabling tor.service" systemctl enable tor
-  step "Starting tor.service" systemctl start tor
-  date -u +'%Y-%m-%d %H:%M:%S UTC on' > "$STATE_DIR/last" 2>/dev/null || true
-  ok "Tor started."
-  su -s /bin/zsh -c "$0 status" "${SUDO_USER:-root}" 2>/dev/null || "$0" status
+  print -P "%F{green}[i]%f archcrypt Network Details -"
+  print
+
+  command -v rfkill &>/dev/null && step "Clearing persistent rfkill (wifi/wwan/bt)" rfkill unblock all
+
+  if command -v nmcli &>/dev/null; then
+    nm_connect
+  elif systemctl is-active --quiet iwd || systemctl is-enabled --quiet iwd 2>/dev/null; then
+    info "iwd path (no NetworkManager)"
+    step "Restarting iwd" systemctl restart iwd
+    typeset -a WLANS; WLANS=("${(@f)$(ls /sys/class/net | grep -E '^wl|^wlan' || true)}")
+    if (( ${#WLANS} )); then
+      local w="${WLANS[1]}"; step "Scanning on ${w}" iwctl station "$w" scan
+      if (( ${#PREFERRED_SSIDS} )); then
+        local connected=0 ssid
+        for ssid in "${PREFERRED_SSIDS[@]}"; do
+          info "Trying SSID: $ssid"
+          if iwctl station "$w" connect "$ssid" &>/dev/null; then ok "Connected: $ssid"; connected=1; break; fi
+          warn "Could not connect: $ssid"
+        done
+        (( connected )) || warn "No preferred SSID connected; run:  iwctl station $w connect <SSID>"
+      else
+        warn "No SSIDs provided; run:  iwctl station $w connect <SSID>"
+      fi
+    else
+      warn "No wlan* interface found."
+    fi
+  else
+    info "Minimal wired fallback"
+    info "Bringing non-loopback links up…"
+    local dev; for dev in $(list_ifaces); do ip link set "$dev" up &>/dev/null || true; done
+    info "Attempting DHCP on common wired names…"
+    for dev in eth0 eno1 enp0s25 enp3s0 enp2s0; do
+      command -v dhcpcd &>/dev/null && dhcpcd -n "$dev" &>/dev/null || true
+      command -v dhclient &>/dev/null && dhclient -1 "$dev" &>/dev/null || true
+    done
+  fi
+
+  info "Connectivity check"
+  local gw dev; dev="$(default_dev || true)"; gw="$(ip route show default | awk '/default/{print $3; exit}')"
+  [[ -n "$gw" ]] && (ping -W1 -c1 "$gw" &>/dev/null && ok "Ping gateway $gw (dev $dev)") || warn "Gateway ping skipped/failed"
+  (ping -W1 -c1 1.1.1.1 &>/dev/null && ok "Ping 1.1.1.1 OK") || warn "No ICMP to 1.1.1.1"
+  (getent hosts archlinux.org &>/dev/null && ok "DNS OK (archlinux.org)") || warn "DNS lookup failed (archlinux.org)"
+
+  cmd_status "no-clear"
 }
 
 cmd_off(){
-  if [[ $EUID -ne 0 ]]; then exec sudo -E "$0" off; fi
   clear; banner
-  info "Stopping Tor"
-  ensure_state_dir
-  step "Stopping tor.service" systemctl stop tor
-  date -u +'%Y-%m-%d %H:%M:%S UTC off' > "$STATE_DIR/last" 2>/dev/null || true
-  ok "Tor stopped."
-  su -s /bin/zsh -c "$0 status" "${SUDO_USER:-root}" 2>/dev/null || "$0" status
+  print -P "%F{green}[i]%f archcrypt Network Details -"
+  print
+
+  if command -v nmcli &>/dev/null; then
+    nm_disconnect_all
+  fi
+  info "Bringing non-loopback links down…"
+  local dev; for dev in $(list_ifaces); do ip link set "$dev" down &>/dev/null || true; done
+
+  if command -v rfkill &>/dev/null; then
+    step "Applying persistent rfkill (wifi/wwan/bt)" sh -c 'rfkill block wifi; rfkill block wwan; rfkill block bluetooth'
+    warn "Radios hard-blocked across reboots. Use 'net-toggle on' to restore."
+  else
+    warn "rfkill not installed; cannot persistently block radios."
+  fi
+
+  cmd_status "no-clear"
 }
 
 case "${1:-}" in
@@ -189,10 +369,10 @@ case "${1:-}" in
   off)     shift; cmd_off "$@" ;;
   status)  shift; cmd_status "$@" ;;
   *)
-    print -P "%F{yellow}Usage:%f tor-toggle {on|off|status}"
-    print "  on     : enable+start tor.service (sudo only for this step)"
-    print "  off    : stop tor.service (sudo only for this step)"
-    print "  status : show Tor service + Tor exit check + Tor network speed (5s DL/UL)"
+    print -P "%F{yellow}Usage:%f net-toggle {on|off|status}"
+    print "  on     : NM-first bring-up (unblock radios, NM up, Ethernet→Wi-Fi)"
+    print "  off    : ultra-secure: NM disconnect, links down, PERSISTENT rfkill (wifi/wwan/bt)"
+    print "  status : full network details + per-IFACE speed; Tor section only if active"
     exit 2
     ;;
 esac
