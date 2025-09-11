@@ -1,10 +1,10 @@
 #!/usr/bin/env zsh
-# v 1.1 yuriy edition
+# v 1.2 yuriy edition
 # net-toggle — NM-first network controller + full status (zsh)
 # on     : bring networking up via NetworkManager (Ethernet→Wi-Fi). Clears persistent rfkill.
 # off    : ultra-secure: NM disconnect, links down, PERSISTENT rfkill (wifi/wwan/bt). Then shows status.
-# status : pretty status; focuses on default interface; Tor section inline; 5s DL/UL speed for default IF + Tor (if active).
-SCRIPT_VER="2025-09-11.1"
+# status : pretty status; default IF first; Tor section inline; 5s DL/UL speed for default/first-UP IF + Tor (if active).
+SCRIPT_VER="2025-09-11.2"
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -100,14 +100,17 @@ print_dns(){
   info "DNS"
   if command -v resolvectl &>/dev/null; then
     resolvectl dns 2>/dev/null | awk '
-      /^Global/ { print "      Global: " $3; next }
-      /^Link/   {
-        # sample: "Link  3 (wlan0): 192.168.1.254 1.1.1.1"
-        for(i=1;i<=NF;i++) if($i ~ /\(.+\)/){iface=$i; gsub(/\(|\)/,"",iface)}
-        servers=""
-        for(i=1;i<=NF;i++) if($i ~ /[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+|:/){servers = (servers?servers" ":"") $i}
-        if(iface!="") print "      " iface ": " servers; else print "      Link: " servers
-      }'
+      /^Global/ {
+        printf "      Global: "
+        for(i=3;i<=NF;i++){ printf (i>3?" ":"") $i }
+        print ""; next
+      }
+      # Match: Link <num> (<iface>): <server...>
+      match($0,/^Link[[:space:]]+[0-9]+[[:space:]]+\(([^)]+)\):[[:space:]]*(.*)$/,m){
+        iface=m[1]; servers=m[2]; gsub(/[[:space:]]+$/,"",servers);
+        print "      " iface ": " servers; next
+      }
+    '
   else
     awk '/^nameserver/{print "      resolv.conf: " $2}' /etc/resolv.conf 2>/dev/null || true
   fi
@@ -177,19 +180,16 @@ st_cli_iface(){
   printf "%s|%s\n" "${dl:-—}" "${ul:-—}"
 }
 speedtest_iface_best(){
-  local ifc="$1" res dl ul used=""
+  local ifc="$1" res
   [[ -n "$(iface_ipv4 "$ifc")" ]] || { echo "—|—"; return 0; }
   if command -v iperf3 &>/dev/null && [[ -n "${SPEEDTEST_IPERF_SERVER:-}" ]]; then
-    res=$(st_iperf3_iface "$ifc" "$SPEEDTEST_IPERF_SERVER" || true)
-    [[ -n "$res" ]] && { print -r -- "$res"; return 0; }
+    res=$(st_iperf3_iface "$ifc" "$SPEEDTEST_IPERF_SERVER" || true); [[ -n "$res" ]] && { print -r -- "$res"; return 0; }
   fi
   if command -v speedtest &>/dev/null; then
-    res=$(st_ookla_iface "$ifc" || true)
-    [[ -n "$res" ]] && { print -r -- "$res"; return 0; }
+    res=$(st_ookla_iface "$ifc" || true); [[ -n "$res" ]] && { print -r -- "$res"; return 0; }
   fi
   if command -v speedtest-cli &>/dev/null; then
-    res=$(st_cli_iface "$ifc" || true)
-    [[ -n "$res" ]] && { print -r -- "$res"; return 0; }
+    res=$(st_cli_iface "$ifc" || true); [[ -n "$res" ]] && { print -r -- "$res"; return 0; }
   fi
   echo "No tool|Install iperf3"
 }
@@ -206,15 +206,6 @@ tor_check(){
   local is_tor ip; is_tor=$(printf "%s" "$out" | grep -q '"IsTor":[ ]*true' && echo true || echo false)
   ip=$(printf "%s" "$out" | grep -o '"IP":"[^"]*"' | cut -d\" -f4)
   printf "    %-18s %s (IP: %s)\n" "Tor check" "$is_tor" "${ip:-?}"
-}
-tor_circuit_count(){
-  # Try to read cookie and query control port
-  local cookie="/run/tor/control.authcookie"
-  [[ -r "$cookie" ]] || { echo ""; return 0; }
-  local resp
-  resp=$( (printf 'AUTHENTICATE\r\nGETINFO circuit-status\r\nQUIT\r\n' | nc -w 2 127.0.0.1 9051) 2>/dev/null || true )
-  [[ -z "$resp" ]] && { echo ""; return 0; }
-  echo "$resp" | awk '/^250-circuit-status/ || /^250\+/ {c++} END{if(c>0) print c; else print ""}'
 }
 tor_speed_5s(){
   command -v curl &>/dev/null || { echo "—|—"; return 0; }
@@ -252,8 +243,7 @@ print_status(){
   info "Basics"
   net_basics
 
-  # ---- Tor status here (between Basics and DNS) ----
-  info "Tor status"
+  info "Tor service"
   if tor_active; then
     printf "    %-18s %s\n" "Tor"     "active"
     printf "    %-18s %s\n" "Enabled" "$(tor_enabled && echo enabled || echo disabled)"
@@ -262,35 +252,41 @@ print_status(){
     listening 9050 || true
     listening 9051 || true
     tor_check
-    local cc; cc="$(tor_circuit_count || true)"; [[ -n "$cc" ]] && printf "    %-18s %s\n" "Circuits" "$cc"
   else
     printf "    %-18s %s\n" "Tor" "not active"
   fi
 
-  # DNS (clean formatting)
   print_dns
 
-  # Interfaces: show default interface first, then others.
   info "Interfaces"
-  local def ifc shown=()
+  local def ifc
   def="$(default_dev || true)"
-  if [[ -n "$def" ]]; then iface_block "$def"; print; shown+=("$def"); fi
+  # Show default first if available
+  if [[ -n "$def" ]]; then iface_block "$def"; print; fi
+  # Then show the rest (always lists all non-lo, even if disconnected)
   for ifc in $(list_ifaces); do
     [[ "$ifc" == "$def" ]] && continue
     iface_block "$ifc"; print
   done
 
-  # Internet speed for the connected/default interface (5s)
   info "Network speed"
+  # pick default IF or first UP IF with IPv4
+  local test_if=""
   if [[ -n "$def" && -n "$(iface_ipv4 "$def")" ]]; then
-    local res dl ul; res="$(speedtest_iface_best "$def")"
+    test_if="$def"
+  else
+    for ifc in $(up_ifaces); do
+      if [[ -n "$(iface_ipv4 "$ifc")" ]]; then test_if="$ifc"; break; fi
+    done
+  fi
+  if [[ -n "$test_if" ]]; then
+    local res dl ul; res="$(speedtest_iface_best "$test_if")"
     dl="${res%%|*}"; ul="${res##*|}"
-    printf "      %-16s ↓ %s   ↑ %s\n" "$def" "$dl" "$ul"
+    printf "      %-16s ↓ %s   ↑ %s\n" "$test_if" "$dl" "$ul"
   else
     printf "      %s\n" "No active interface with IP — skipping."
   fi
 
-  # Tor network speed (if Tor active)
   info "Tor network speed"
   if tor_active && socks_listening; then
     local tres tdl tul; tres="$(tor_speed_5s)"; tdl="${tres%%|*}"; tul="${tres##*|}"
