@@ -1,39 +1,39 @@
 #!/usr/bin/env zsh
-# v 7.0 yuriy edition
+# v 9.0 yuriy edition 
 # net-toggle — NM-first network controller + full status (zsh)
 # on     : bring networking up via NetworkManager (Ethernet→Wi-Fi). Clears persistent rfkill.
 # off    : ultra-secure: NM disconnect, links down, PERSISTENT rfkill (wifi/wwan/bt). Then shows status.
-# status : NetworkManager state, basics, Tor status, active interface(s) + Internet speed (and Tor speed if active).
-SCRIPT_VER="2025-09-11.7"
+# status : NM state, basics, Tor status, DNS (clean), Interfaces (active), Internet speed (and Tor speed if active).
+SCRIPT_VER="2025-09-11.9"
 
 set -Eeuo pipefail
 IFS=$'\n\t'
 : ${TERM:="xterm-256color"}
 : ${COLUMNS:=80}
 
-# ---------- CONFIG ----------
-typeset -a PREFERRED_SSIDS=( )
+# ---------------- CONFIG ----------------
+typeset -a PREFERRED_SSIDS=( )   # e.g. ("Home" "Hotspot")
 : ${SPEEDTEST_IPERF_SERVER:=iperf.he.net}
 : ${SPEEDTEST_TIMEOUT_SEC:=30}
 
-# Small HTTP objects for portable speed tests
+# Small HTTP endpoints for portable speed tests (fallback if no iperf3/Ookla)
 : ${NET_DL_URL:=https://speed.hetzner.de/10MB.bin}
 : ${NET_UL_URL:=https://httpbin.org/post}
 
-# Tor speed tests (use small/ranged downloads to avoid stalls)
+# Tor speed tests (through SOCKS, small/ranged so exits don’t stall)
 : ${TOR_DL_URL:=https://speed.hetzner.de/10MB.bin}
 : ${TOR_DL_URL_ALT:=https://proof.ovh.net/files/10Mb.dat}
 : ${TOR_UL_URL:=https://httpbin.org/post}
 : ${TOR_TEST_SECS:=6}
 
-# ---------- UI ----------
+# ---------------- UI ----------------
 autoload -Uz colors && colors || true
 ok()   { print -P "%F{green}[✓]%f $*"; }
 warn() { print -P "%F{yellow}[!]%f $*"; }
 err()  { print -P "%F{red}[✗]%f $*" >&2; }
 info() { print -P "%F{cyan}[*]%f $*"; }
 
-banner(){
+banner() {
   local h="$(hostname -s 2>/dev/null || echo archcrypt)"
   local d="$(date '+%Y-%m-%d %H:%M:%S %Z')"
   print -P "%F{magenta}=====================================================%f"
@@ -41,35 +41,35 @@ banner(){
   print -P "%F{magenta}=====================================================%f"
 }
 
-step(){ local msg="$1"; shift; if "$@" &>/tmp/.nettoggle.step.log; then ok "$msg"; else warn "$msg (non-fatal)"; return 1; fi }
+step() { local msg="$1"; shift; if "$@" &>/tmp/.nettoggle.step.log; then ok "$msg"; else warn "$msg (non-fatal)"; return 1; fi }
 
-# ---------- ROOT ----------
+# ---------------- ROOT ----------------
 if [[ $EUID -ne 0 ]]; then exec sudo -E "$0" "$@"; fi
 
-# ---------- COMMON ----------
+# ---------------- COMMON ----------------
 readf(){ [[ -r "$1" ]] && <"$1" tr -d '\n' || echo 0; }
 list_ifaces(){ ip -o link show | awk -F': ' '$2!="lo"{print $2}'; }
 oper_up(){ [[ "$(</sys/class/net/$1/operstate 2>/dev/null || echo down)" == up ]]; }
 iface_ipv4(){ ip -o -4 addr show "$1" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1; }
-iface_ipv6_all(){ ip -o -6 addr show "$1" 2>/dev/null | awk '{print $4}' | sed 's,/, ,g' | paste -sd ' '; }
+iface_ipv6_all(){ ip -o -6 addr show "$1" 2>/dev/null | awk '{print $4}' | sed 's,/, ,g' | paste -sd ' ' || true; }
 default_dev(){ ip route show default 2>/dev/null | awk '/default/ {print $5; exit}'; }
 
-# ---------- NetworkManager helpers ----------
-nm_make_primary(){
+# ---------------- NetworkManager helpers ----------------
+nm_make_primary() {
   systemctl is-active --quiet iwd            && step "Stopping iwd (use NM for Wi-Fi)" systemctl stop iwd || true
   systemctl is-active --quiet wpa_supplicant && step "Stopping wpa_supplicant (use NM)" systemctl stop wpa_supplicant || true
   step "Starting NetworkManager" systemctl start NetworkManager
   step "Enabling NM networking"  nmcli networking on
   step "Allowing radios (Wi-Fi/WWAN)"  sh -c 'nmcli radio wifi on; nmcli radio wwan on'
 }
-nm_fix_unmanaged(){
+nm_fix_unmanaged() {
   local -a u; u=("${(@f)$(nmcli -t -f DEVICE,STATE dev 2>/dev/null | awk -F: '$2=="unmanaged"{print $1}')}") || true
   (( ${#u} )) || return 0
   info "Fixing unmanaged devices: ${u[*]}"
   local d; for d in "${u[@]}"; do nmcli device set "$d" managed yes &>/dev/null || true; done
   sleep 1
 }
-nm_connect(){
+nm_connect() {
   nm_make_primary
   nm_fix_unmanaged
   info "Connecting Ethernet (if present)…"
@@ -91,7 +91,7 @@ nm_connect(){
     fi
   fi
 }
-nm_disconnect_all(){
+nm_disconnect_all() {
   local -a c; c=("${(@f)$(nmcli -t -f DEVICE,STATE dev 2>/dev/null | awk -F: '$2=="connected"{print $1}')}") || true
   if (( ${#c} )); then
     info "Disconnecting: ${c[*]}"
@@ -102,25 +102,32 @@ nm_disconnect_all(){
   step "Turning NM networking off" nmcli networking off
 }
 
-# ---------- Basics + DNS ----------
-print_dns(){
+# ---------------- Basics + DNS ----------------
+print_dns() {
   info "DNS"
   if command -v resolvectl &>/dev/null; then
     resolvectl dns 2>/dev/null | awk '
       /^Global/ {
-        printf "      Global: "
-        for(i=3;i<=NF;i++){ printf (i>3?" ":"") $i }
-        print ""; next
+        # Global servers: print one per line
+        for(i=3;i<=NF;i++){
+          if(i==3) printf "      Global:\n";
+          print "        " $i
+        }
+        next
       }
       match($0,/^Link[[:space:]]+[0-9]+[[:space:]]+\(([^)]+)\):[[:space:]]*(.*)$/,m){
-        iface=m[1]; servers=m[2]; gsub(/[[:space:]]+$/,"",servers);
-        print "      " iface ": " servers; next
+        iface=m[1]; servers=m[2];
+        gsub(/[[:space:]]+$/,"",servers);
+        print "      " iface ":"
+        n=split(servers,a," "); for(i=1;i<=n;i++) if(a[i]!="") print "        " a[i]
+        next
       }'
   else
-    awk '/^nameserver/{print "      resolv.conf: " $2}' /etc/resolv.conf 2>/dev/null || true
+    # resolv.conf fallback
+    awk '/^nameserver/{if(!h){print "      resolv.conf:"; h=1} print "        " $2}' /etc/resolv.conf 2>/dev/null || true
   fi
 }
-net_basics(){
+net_basics() {
   local dev gw4 gw6
   dev="$(default_dev || true)"
   gw4="$(ip route show default 2>/dev/null | awk '/default/{print $3; exit}')"
@@ -130,8 +137,8 @@ net_basics(){
   printf "    %-18s %s\n" "Gateway(v6)" "${gw6:-—}"
 }
 
-# ---------- Interfaces (robust printing) ----------
-iface_block(){
+# ---------------- Interfaces (robust) ----------------
+iface_block() {
   local ifc="$1" type="ethernet"
   [[ "$ifc" == wl* || "$ifc" == wlan* ]] && type="wifi"
   local ip4 ip6 state ssid="" rate=""
@@ -155,8 +162,8 @@ iface_block(){
   printf "    %-18s %s\n" "IPv6" "${ip6:-—}"
 }
 
-# ---------- Internet speed (best available tool, else curl fallback) ----------
-st_iperf3_iface(){
+# ---------------- Internet speed (best available tool; never abort) ----------------
+st_iperf3_iface() {
   local ifc="$1" srv="$2" ip dl ul out
   ip="$(iface_ipv4 "$ifc")"; [[ -z "$ip" ]] && { echo "—|—"; return 0; }
   out=$(timeout ${SPEEDTEST_TIMEOUT_SEC}s iperf3 -J -R -t 5 -f m -B "$ip" -c "$srv" 2>/dev/null || true)
@@ -165,14 +172,14 @@ st_iperf3_iface(){
   ul=$(print -r -- "$out" | awk -F'[,: ]+' '/"end"/,0 {if($0 ~ /bits_per_second/){v=$NF}} END{if(v!="") printf "%.1f Mb/s", v/1e6}')
   echo "${dl:-—}|${ul:-—}"
 }
-st_ookla_iface(){
+st_ookla_iface() {
   local ifc="$1" out dl ul
   out=$(timeout ${SPEEDTEST_TIMEOUT_SEC}s speedtest --accept-license --accept-gdpr --interface "$ifc" 2>/dev/null | sed 's/\r/\n/g' || true)
   dl=$(print -r -- "$out" | awk -F': *' '/^Download/ {print $2; exit}')
   ul=$(print -r -- "$out" | awk -F': *' '/^Upload/   {print $2; exit}')
   echo "${dl:-—}|${ul:-—}"
 }
-st_cli_iface(){
+st_cli_iface() {
   local ifc="$1" ip out dl ul
   ip="$(iface_ipv4 "$ifc")"; [[ -z "$ip" ]] && { echo "—|—"; return 0; }
   out=$(timeout ${SPEEDTEST_TIMEOUT_SEC}s speedtest-cli --simple --source "$ip" 2>/dev/null || true)
@@ -180,15 +187,13 @@ st_cli_iface(){
   ul=$(print -r -- "$out" | awk '/^Upload/  {print $2" " $3; exit}')
   echo "${dl:-—}|${ul:-—}"
 }
-st_curl_iface(){
+st_curl_iface() {
   command -v curl &>/dev/null || { echo "—|—"; return 0; }
   local ifc="$1" w bytes t dl ul
-  # DL: small ranged fetch so slow exits don’t hang
   w=$(curl -sS --interface "$ifc" -H 'Range: bytes=0-5000000' -o /dev/null --max-time 10 \
         -w '%{size_download} %{time_total}' "$NET_DL_URL" 2>/dev/null) || true
   bytes=$(cut -d' ' -f1 <<<"$w" 2>/dev/null || echo 0); t=$(cut -d' ' -f2 <<<"$w" 2>/dev/null || echo 0)
   [[ "$bytes" -gt 0 && "$t" != "0" ]] && dl=$(awk -v b="$bytes" -v tt="$t" 'BEGIN{printf "%.1f Mb/s",(b*8)/(tt*1e6)}')
-  # UL: ~8MB POST
   w=$(head -c 8388608 /dev/zero | \
       curl -sS --interface "$ifc" -X POST --data-binary @- --max-time 10 \
            -o /dev/null -w '%{size_upload} %{time_total}' "$NET_UL_URL" 2>/dev/null) || true
@@ -196,7 +201,7 @@ st_curl_iface(){
   [[ "$bytes" -gt 0 && "$t" != "0" ]] && ul=$(awk -v b="$bytes" -v tt="$t" 'BEGIN{printf "%.1f Mb/s",(b*8)/(tt*1e6)}')
   echo "${dl:-—}|${ul:-—}"
 }
-speedtest_iface_best(){
+speedtest_iface_best() {
   local ifc="$1" res
   if command -v iperf3 &>/dev/null && [[ -n "${SPEEDTEST_IPERF_SERVER:-}" ]]; then
     res=$(st_iperf3_iface "$ifc" "$SPEEDTEST_IPERF_SERVER" || true); [[ -n "$res" ]] && { print -r -- "$res"; return 0; }
@@ -211,12 +216,12 @@ speedtest_iface_best(){
   echo "—|—"
 }
 
-# ---------- Tor helpers ----------
+# ---------------- Tor helpers ----------------
 tor_active(){ systemctl is-active --quiet tor; }
 tor_enabled(){ systemctl is-enabled --quiet tor 2>/dev/null; }
 socks_listening(){ ss -lnH 'sport = :9050' 2>/dev/null | grep -q .; }
 listening(){ ss -lnH "sport = :$1" 2>/dev/null | awk '{print "    "$1,$4}'; }
-tor_check(){
+tor_check() {
   if ! command -v curl &>/dev/null; then printf "    %-18s %s\n" "Tor check" "curl not installed"; return; fi
   local out; out=$(timeout 10s curl -s --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip 2>/dev/null) || true
   if [[ -z "$out" ]]; then printf "    %-18s %s\n" "Tor check" "no response"; return; fi
@@ -224,10 +229,9 @@ tor_check(){
   ip=$(printf "%s" "$out" | grep -o '"IP":"[^"]*"' | cut -d\" -f4)
   printf "    %-18s %s (IP: %s)\n" "Tor check" "$is_tor" "${ip:-?}"
 }
-tor_speed_5s(){
+tor_speed_5s() {
   command -v curl &>/dev/null || { echo "—|—"; return 0; }
   local w bytes t dl ul
-  # Download via SOCKS with ranged fetch; fall back to alternate host
   w=$(curl -sS --socks5-hostname 127.0.0.1:9050 -H 'Range: bytes=0-5000000' -o /dev/null --max-time $((TOR_TEST_SECS+4)) \
        -w '%{size_download} %{time_total}' "$TOR_DL_URL" 2>/dev/null) || true
   if [[ -z "$w" || "$w" == "0 0.000" ]]; then
@@ -237,7 +241,6 @@ tor_speed_5s(){
   bytes=$(cut -d' ' -f1 <<<"$w" 2>/dev/null || echo 0); t=$(cut -d' ' -f2 <<<"$w" 2>/dev/null || echo 0)
   [[ "$bytes" -gt 0 && "$t" != "0" ]] && dl=$(awk -v b="$bytes" -v tt="$t" 'BEGIN{printf "%.1f Mb/s",(b*8)/(tt*1e6)}')
 
-  # Upload via SOCKS (8MB)
   w=$(head -c 8388608 /dev/zero | \
       curl -sS --socks5-hostname 127.0.0.1:9050 -X POST --data-binary @- \
            --max-time $((TOR_TEST_SECS+4)) -o /dev/null -w '%{size_upload} %{time_total}' "$TOR_UL_URL" 2>/dev/null) || true
@@ -247,8 +250,8 @@ tor_speed_5s(){
   echo "${dl:-—}|${ul:-—}"
 }
 
-# ---------- STATUS ----------
-print_status(){
+# ---------------- STATUS (single entry point) ----------------
+print_status() {
   clear; banner
   print -P "%F{green}[i]%f archcrypt Network Details -"
   print
@@ -287,11 +290,11 @@ print_status(){
   local def ifc printed=0
   def="$(default_dev || true)"
 
-  # Always show default dev if it has an IP (even if operstate is bogus)
+  # Always show the default device if it has an IP
   if [[ -n "$def" && -n "$(iface_ipv4 "$def" || true)" ]]; then
     iface_block "$def"; print; printed=1
   fi
-  # Show any other interface that is UP or has an IP
+  # Also show any other interface that is UP or has an IP
   for ifc in $(list_ifaces); do
     [[ "$ifc" == "$def" ]] && continue
     if oper_up "$ifc" || [[ -n "$(iface_ipv4 "$ifc" || true)" ]]; then
@@ -320,8 +323,8 @@ print_status(){
   ok "Status captured."
 }
 
-# ---------- COMMANDS ----------
-cmd_on(){
+# ---------------- COMMANDS ----------------
+cmd_on() {
   clear; banner
   print -P "%F{green}[i]%f archcrypt Network Details -"
   print
@@ -366,7 +369,7 @@ cmd_on(){
   print_status
 }
 
-cmd_off(){
+cmd_off() {
   clear; banner
   print -P "%F{green}[i]%f archcrypt Network Details -"
   print
