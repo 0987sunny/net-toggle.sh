@@ -3,8 +3,8 @@
 # net-toggle — NM-first network controller + full status (zsh)
 # on     : bring networking up via NetworkManager (Ethernet→Wi-Fi). Clears persistent rfkill.
 # off    : ultra-secure: NM disconnect, links down, PERSISTENT rfkill (wifi/wwan/bt). Then shows status.
-# status : compact status; default IF first; 5s DL/UL speed for active IF; Tor status always shown (with Tor speed if active).
-SCRIPT_VER="2025-09-11.5"
+# status : compact status; always shows Tor section; shows active interface(s) and does DL/UL speed.
+SCRIPT_VER="2025-09-11.6"
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -13,18 +13,18 @@ IFS=$'\n\t'
 
 # ------------ CONFIG ------------
 typeset -a PREFERRED_SSIDS=( )
-: ${SPEEDTEST_IPERF_SERVER:=iperf.he.net}  # used when iperf3 is installed
+: ${SPEEDTEST_IPERF_SERVER:=iperf.he.net}
 : ${SPEEDTEST_TIMEOUT_SEC:=30}
 
-# Tor speed test endpoints (small, steady)
+# curl-based HTTP test endpoints (small, reliable)
+: ${NET_DL_URL:=https://speed.hetzner.de/10MB.bin}
+: ${NET_UL_URL:=https://httpbin.org/post}
+
+# Tor speed test endpoints
 : ${TOR_DL_URL:=https://speed.hetzner.de/10MB.bin}
 : ${TOR_DL_URL_2:=https://proof.ovh.net/files/10Mb.dat}
-: ${TOR_UL_URL:=https://speed.hetzner.de/upload.php}
+: ${TOR_UL_URL:=https://httpbin.org/post}
 : ${TOR_TEST_SECS:=6}
-
-# Regular curl fallback endpoints
-: ${NET_DL_URL:=https://speed.hetzner.de/10MB.bin}
-: ${NET_UL_URL:=https://httpbin.org/post}   # generic upload sink
 
 # ------------ UI ------------
 autoload -Uz colors && colors || true
@@ -49,11 +49,7 @@ if [[ $EUID -ne 0 ]]; then exec sudo -E "$0" "$@"; fi
 # ------------ COMMON ------------
 readf(){ [[ -r "$1" ]] && <"$1" tr -d '\n' || echo 0; }
 list_ifaces(){ ip -o link show | awk -F': ' '$2!="lo"{print $2}'; }
-up_ifaces(){
-  for i in $(list_ifaces); do
-    [[ "$(</sys/class/net/$i/operstate 2>/dev/null || echo down)" == up ]] && echo "$i"
-  done
-}
+oper_up(){ [[ "$(</sys/class/net/$1/operstate 2>/dev/null || echo down)" == up ]]; }
 iface_ipv4(){ ip -o -4 addr show "$1" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1; }
 iface_ipv6_all(){ ip -o -6 addr show "$1" 2>/dev/null | awk '{print $4}' | sed 's,/, ,g' | paste -sd ' '; }
 default_dev(){ ip route show default 2>/dev/null | awk '/default/ {print $5; exit}'; }
@@ -107,7 +103,7 @@ nm_disconnect_all(){
   step "Turning NM networking off" nmcli networking off
 }
 
-# ------------ Basics + DNS (clean per-link formatting) ------------
+# ------------ Basics + DNS ------------
 print_dns(){
   info "DNS"
   if command -v resolvectl &>/dev/null; then
@@ -135,13 +131,12 @@ net_basics(){
   printf "    %-18s %s\n" "Gateway(v6)" "${gw6:-—}"
 }
 
-# ------------ Interface block (only UP) ------------
+# ------------ Interfaces (prefer UP, but show default even if odd) ------------
 iface_block(){
   local ifc="$1" type="ethernet"
   [[ "$ifc" == wl* || "$ifc" == wlan* ]] && type="wifi"
   local ip4 ip6 state ssid="" rate=""
-  state="$(</sys/class/net/"$ifc"/operstate 2>/dev/null || echo down)"
-  [[ "$state" != "up" ]] && return 0
+  state="$(</sys/class/net/"$ifc"/operstate 2>/dev/null || echo unknown)"
   ip4="$(iface_ipv4 "$ifc" || true)"
   ip6="$(iface_ipv6_all "$ifc" || true)"
   if [[ "$type" == "wifi" ]] && command -v nmcli &>/dev/null; then
@@ -161,8 +156,7 @@ iface_block(){
   printf "    %-18s %s\n" "IPv6" "${ip6:-—}"
 }
 
-# ------------ Internet speed (5s) ------------
-# iperf3 preferred; then Ookla; then speedtest-cli; finally curl fallback bound to interface.
+# ------------ Speed logic (5–8s) ------------
 st_iperf3_iface(){
   local ifc="$1" srv="$2" ip dl ul out
   ip="$(iface_ipv4 "$ifc")"; [[ -z "$ip" ]] && { echo "—|—"; return 0; }
@@ -190,20 +184,15 @@ st_cli_iface(){
 st_curl_iface(){
   command -v curl &>/dev/null || { echo "—|—"; return 0; }
   local ifc="$1" w bytes t dl ul
-
-  # Download
   w=$(curl -sS --interface "$ifc" -o /dev/null --max-time 8 \
         -w '%{size_download} %{time_total}' "$NET_DL_URL" 2>/dev/null) || true
   bytes=$(cut -d' ' -f1 <<<"$w" 2>/dev/null || echo 0); t=$(cut -d' ' -f2 <<<"$w" 2>/dev/null || echo 0)
   [[ "$bytes" -gt 0 && "$t" != "0" ]] && dl=$(awk -v b="$bytes" -v tt="$t" 'BEGIN{printf "%.1f Mb/s",(b*8)/(tt*1e6)}')
-
-  # Upload (~8MB)
   w=$(head -c 8388608 /dev/zero | \
       curl -sS --interface "$ifc" -X POST --data-binary @- --max-time 8 \
            -o /dev/null -w '%{size_upload} %{time_total}' "$NET_UL_URL" 2>/dev/null) || true
   bytes=$(cut -d' ' -f1 <<<"$w" 2>/dev/null || echo 0); t=$(cut -d' ' -f2 <<<"$w" 2>/dev/null || echo 0)
   [[ "$bytes" -gt 0 && "$t" != "0" ]] && ul=$(awk -v b="$bytes" -v tt="$t" 'BEGIN{printf "%.1f Mb/s",(b*8)/(tt*1e6)}')
-
   echo "${dl:-—}|${ul:-—}"
 }
 speedtest_iface_best(){
@@ -220,7 +209,6 @@ speedtest_iface_best(){
     res=$(st_cli_iface "$ifc" || true)
     [[ -n "$res" ]] && { print -r -- "$res"; return 0; }
   fi
-  # Final fallback
   res=$(st_curl_iface "$ifc" || true)
   [[ -n "$res" ]] && { print -r -- "$res"; return 0; }
   echo "—|—"
@@ -242,8 +230,6 @@ tor_check(){
 tor_speed_5s(){
   command -v curl &>/dev/null || { echo "—|—"; return 0; }
   local w bytes t dl ul
-
-  # Download (primary then fallback)
   w=$(curl -sS --socks5-hostname 127.0.0.1:9050 -o /dev/null --max-time $((TOR_TEST_SECS+3)) \
        -w '%{size_download} %{time_total}' "$TOR_DL_URL" 2>/dev/null) || true
   if [[ -z "$w" || "$w" == "0 0.000" ]]; then
@@ -253,7 +239,6 @@ tor_speed_5s(){
   bytes=$(cut -d' ' -f1 <<<"$w" 2>/dev/null || echo 0); t=$(cut -d' ' -f2 <<<"$w" 2>/dev/null || echo 0)
   [[ "$bytes" -gt 0 && "$t" != "0" ]] && dl=$(awk -v b="$bytes" -v tt="$t" 'BEGIN{printf "%.1f Mb/s",(b*8)/(tt*1e6)}')
 
-  # Upload (~8MB)
   w=$(head -c 8388608 /dev/urandom | \
       curl -sS --socks5-hostname 127.0.0.1:9050 -X POST --data-binary @- \
            --max-time $((TOR_TEST_SECS+3)) -o /dev/null -w '%{size_upload} %{time_total}' "$TOR_UL_URL" 2>/dev/null) || true
@@ -301,27 +286,29 @@ print_status(){
   print_dns
 
   info "Interfaces"
-  local def ifc
+  local def ifc shown=0
   def="$(default_dev || true)"
-  # default first if UP; then other UP interfaces
-  if [[ -n "$def" && "$(</sys/class/net/$def/operstate 2>/dev/null || echo down)" == "up" ]]; then
-    iface_block "$def"; print
+
+  # Show default device regardless of operstate weirdness if it has an IP
+  if [[ -n "$def" && ( "$(oper_up "$def" && echo up || echo down)" = "up" || -n "$(iface_ipv4 "$def")" ) ]]; then
+    iface_block "$def"; print; shown=1
   fi
-  for ifc in $(up_ifaces); do
+  # Show other UP interfaces (not the default)
+  for ifc in $(list_ifaces); do
     [[ "$ifc" == "$def" ]] && continue
-    iface_block "$ifc"; print
+    if oper_up "$ifc"; then iface_block "$ifc"; print; shown=1; fi
   done
+  (( shown )) || printf "      %s\n" "No active interfaces."
 
   info "Network speed"
   local test_if=""
-  if [[ -n "$def" && "$(</sys/class/net/$def/operstate 2>/dev/null || echo down)" == "up" && -n "$(iface_ipv4 "$def")" ]]; then
+  if [[ -n "$def" && ( "$(oper_up "$def" && echo up || echo down)" = "up" && -n "$(iface_ipv4 "$def")" ) ]]; then
     test_if="$def"
   else
-    for ifc in $(up_ifaces); do
-      if [[ -n "$(iface_ipv4 "$ifc")" ]]; then test_if="$ifc"; break; fi
+    for ifc in $(list_ifaces); do
+      if oper_up "$ifc" && [[ -n "$(iface_ipv4 "$ifc")" ]]; then test_if="$ifc"; break; fi
     done
   fi
-
   if [[ -n "$test_if" ]]; then
     local res dl ul; res="$(speedtest_iface_best "$test_if" || true)"
     dl="${res%%|*}"; ul="${res##*|}"
