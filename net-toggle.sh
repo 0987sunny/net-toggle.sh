@@ -31,9 +31,9 @@ info() { print -P "%F{cyan}[*]%f $*"; }
 banner(){
   local h="$(hostname -s 2>/dev/null || echo archcrypt)"
   local d="$(date '+%Y-%m-%d %H:%M:%S %Z')"
-  print -P "%F{magenta}=====================================================%f"
-  print -P "%F{yellow}net-toggle — ${h} — ${d}%f"
-  print -P "%F{magenta}=====================================================%f"
+  print -P "%F{magenta}===============================================================================================%f"
+  print -P "%F{yellow}                        net-toggle — ${h} — ${d}%f"
+  print -P "%F{magenta}===============================================================================================%f"
 }
 
 step(){ local msg="$1"; shift; if "$@" &>/tmp/.nettoggle.step.log; then ok "$msg"; else warn "$msg (non-fatal)"; return 1; fi }
