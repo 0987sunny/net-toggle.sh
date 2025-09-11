@@ -1,4 +1,4 @@
-#!/usr/bin/env zsh
+#!/usr/bin/env zsh 
 # v 4.0 yuriy edition
 # net-toggle — NM-first network controller + full status (zsh)
 # on     : bring networking up via NetworkManager (Ethernet→Wi-Fi). Clears persistent rfkill.
