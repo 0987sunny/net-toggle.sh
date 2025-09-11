@@ -1,10 +1,10 @@
 #!/usr/bin/env zsh
-# v 3.2 yuriy edition
+# v 3.3 yuriy edition
 # net-toggle — NM-first network controller + full status (zsh)
 # on     : bring networking up via NetworkManager (Ethernet→Wi-Fi). Clears persistent rfkill.
 # off    : ultra-secure: NM disconnect, links down, PERSISTENT rfkill (wifi/wwan/bt). Then shows status.
 # status : full status; default IF first; 5s DL/UL speed for active IF; Tor status always shown (with Tor speed if active).
-SCRIPT_VER="2025-09-11.3.2"
+SCRIPT_VER="2025-09-11.3.3"
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -24,7 +24,7 @@ typeset -a PREFERRED_SSIDS=( )
 # ---------------- UI ----------------
 autoload -Uz colors && colors || true
 ok()   { print -P "%F{green}[✓]%f $*"; }
-warn() { print -P "%F{yellow}[!]%f $*"; }
+warn() { print -P "%F{yellow}[!]%f $*" >&2; }
 err()  { print -P "%F{red}[✗]%f $*" >&2; }
 info() { print -P "%F{cyan}[*]%f $*"; }
 
@@ -196,7 +196,16 @@ speedtest_iface_best(){
 tor_active(){ systemctl is-active --quiet tor; }
 tor_enabled(){ systemctl is-enabled --quiet tor 2>/dev/null; }
 socks_listening(){ ss -lnH 'sport = :9050' 2>/dev/null | grep -q .; }
-listening(){ ss -lnH "sport = :$1" 2>/dev/null | awk '{print "    "$1,$4}'; }
+
+listening(){
+  local port="$1"
+  local output
+  output=$(ss -lnH "sport = :${port}" 2>/dev/null || true)
+  if [[ -n "$output" ]]; then
+    echo "    $output"
+  fi
+}
+
 tor_check(){
   if ! command -v curl &>/dev/null; then printf "    %-18s %s\n" "Tor check" "curl not installed"; return; fi
   local out; out=$(timeout 8s curl -s --socks5-hostname 127.0.0.1:9050 http://check.torproject.org/api/ip 2>/dev/null) || true
@@ -259,8 +268,8 @@ print_status(){
     printf "    %-18s %s\n" "Enabled"     "$(tor_enabled && echo enabled || echo disabled)"
     printf "    %-18s %s\n" "SOCKS"       "127.0.0.1:9050"
     printf "    %-18s %s\n" "Control"     "127.0.0.1:9051"
-    listening 9050 || true
-    listening 9051 || true
+    listening 9050
+    listening 9051
     tor_check
     # inline tor speed
     local tres tdl tul; tres="$(tor_speed_5s)"; tdl="${tres%%|*}"; tul="${tres##*|}"
