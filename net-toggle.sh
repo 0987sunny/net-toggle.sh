@@ -1,10 +1,10 @@
 #!/usr/bin/env zsh
-# v 3.5 yuriy edition
+# v 3.6 yuriy edition
 # net-toggle — NM-first network controller + full status (zsh)
 # on     : bring networking up via NetworkManager (Ethernet→Wi-Fi). Clears persistent rfkill.
 # off    : ultra-secure: NM disconnect, links down, PERSISTENT rfkill (wifi/wwan/bt). Then shows status.
 # status : full status; default IF first; 5s DL/UL speed for active IF; Tor status always shown (with Tor speed if active).
-SCRIPT_VER="2025-09-11.3.5"
+SCRIPT_VER="2025-09-11.3.6"
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -205,9 +205,9 @@ listening(){
   fi
 }
 tor_check(){
-  if ! command -v curl &>/dev/null; then printf "    %-18s %s\n" "Tor check" "curl not installed"; return; }
+  if ! command -v curl &>/dev/null; then printf "    %-18s %s\n" "Tor check" "curl not installed"; return; fi
   local out; out=$(timeout 8s curl -s --socks5-hostname 127.0.0.1:9050 http://check.torproject.org/api/ip 2>/dev/null) || true
-  if [[ -z "$out" ]]; then printf "    %-18s %s\n" "Tor check" "no response"; return; }
+  if [[ -z "$out" ]]; then printf "    %-18s %s\n" "Tor check" "no response"; return; fi
   local is_tor ip; is_tor=$(printf "%s" "$out" | grep -q '"IsTor":[ ]*true' && echo true || echo false)
   ip=$(printf "%s" "$out" | grep -o '"IP":"[^"]*"' | cut -d\" -f4)
   printf "    %-18s %s (IP: %s)\n" "Tor check" "$is_tor" "${ip:-?}"
