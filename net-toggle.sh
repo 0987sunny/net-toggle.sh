@@ -1,5 +1,5 @@
 #!/usr/bin/env zsh
-# v 2.0 yuriy edition
+# v 3.0 yuriy edition
 # net-toggle — NM-first network controller + full status (zsh)
 # on     : bring networking up via NetworkManager (Ethernet→Wi-Fi). Clears persistent rfkill.
 # off    : ultra-secure: NM disconnect, links down, PERSISTENT rfkill (wifi/wwan/bt). Then shows status.
@@ -222,12 +222,6 @@ print_status(){
   clear; banner
   print -P "%F{green}[i]%f archcrypt Network Details -"
   print
-
-  info "Overview"
-  printf "    %-18s %s\n" "User"    "${SUDO_USER:-$USER}"
-  printf "    %-18s %s\n" "Kernel"  "$(uname -r)"
-  printf "    %-18s %s\n" "TTY"     "$(tty 2>/dev/null || echo n/a)"
-  printf "    %-18s %s\n" "Version" "${SCRIPT_VER}"
 
   if command -v nmcli &>/dev/null; then
     info "NetworkManager"
