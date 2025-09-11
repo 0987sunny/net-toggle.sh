@@ -1,10 +1,10 @@
 #!/usr/bin/env zsh
-# v 3.3 yuriy edition
+# v 3.4 yuriy edition
 # net-toggle — NM-first network controller + full status (zsh)
 # on     : bring networking up via NetworkManager (Ethernet→Wi-Fi). Clears persistent rfkill.
 # off    : ultra-secure: NM disconnect, links down, PERSISTENT rfkill (wifi/wwan/bt). Then shows status.
 # status : full status; default IF first; 5s DL/UL speed for active IF; Tor status always shown (with Tor speed if active).
-SCRIPT_VER="2025-09-11.3.3"
+SCRIPT_VER="2025-09-11.3.4"
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -196,7 +196,6 @@ speedtest_iface_best(){
 tor_active(){ systemctl is-active --quiet tor; }
 tor_enabled(){ systemctl is-enabled --quiet tor 2>/dev/null; }
 socks_listening(){ ss -lnH 'sport = :9050' 2>/dev/null | grep -q .; }
-
 listening(){
   local port="$1"
   local output
@@ -205,7 +204,6 @@ listening(){
     echo "    $output"
   fi
 }
-
 tor_check(){
   if ! command -v curl &>/dev/null; then printf "    %-18s %s\n" "Tor check" "curl not installed"; return; fi
   local out; out=$(timeout 8s curl -s --socks5-hostname 127.0.0.1:9050 http://check.torproject.org/api/ip 2>/dev/null) || true
