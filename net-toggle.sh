@@ -1,10 +1,10 @@
 #!/usr/bin/env zsh
-# v 1.2 yuriy edition
+# v 2.0 yuriy edition
 # net-toggle — NM-first network controller + full status (zsh)
 # on     : bring networking up via NetworkManager (Ethernet→Wi-Fi). Clears persistent rfkill.
 # off    : ultra-secure: NM disconnect, links down, PERSISTENT rfkill (wifi/wwan/bt). Then shows status.
-# status : pretty status; default IF first; Tor section inline; 5s DL/UL speed for default/first-UP IF + Tor (if active).
-SCRIPT_VER="2025-09-11.2"
+# status : full status; default IF first; 5s DL/UL speed for active IF; Tor status always shown (with Tor speed if active).
+SCRIPT_VER="2025-09-11.3"
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -16,7 +16,7 @@ typeset -a PREFERRED_SSIDS=( )
 : ${SPEEDTEST_IPERF_SERVER:=iperf.he.net}
 : ${SPEEDTEST_TIMEOUT_SEC:=30}
 
-# Tor speed test endpoints (used only if tor is active)
+# Tor speed test endpoints (only if tor is active)
 : ${TOR_DL_URL:=https://speed.hetzner.de/100MB.bin}
 : ${TOR_UL_URL:=https://speed.hetzner.de/upload.php}
 : ${TOR_TEST_SECS:=5}
@@ -105,7 +105,6 @@ print_dns(){
         for(i=3;i<=NF;i++){ printf (i>3?" ":"") $i }
         print ""; next
       }
-      # Match: Link <num> (<iface>): <server...>
       match($0,/^Link[[:space:]]+[0-9]+[[:space:]]+\(([^)]+)\):[[:space:]]*(.*)$/,m){
         iface=m[1]; servers=m[2]; gsub(/[[:space:]]+$/,"",servers);
         print "      " iface ": " servers; next
@@ -115,7 +114,6 @@ print_dns(){
     awk '/^nameserver/{print "      resolv.conf: " $2}' /etc/resolv.conf 2>/dev/null || true
   fi
 }
-
 net_basics(){
   local dev gw4 gw6
   dev="$(default_dev || true)"
@@ -243,17 +241,20 @@ print_status(){
   info "Basics"
   net_basics
 
-  info "Tor service"
+  info "Tor status"
   if tor_active; then
-    printf "    %-18s %s\n" "Tor"     "active"
-    printf "    %-18s %s\n" "Enabled" "$(tor_enabled && echo enabled || echo disabled)"
-    printf "    %-18s %s\n" "SOCKS"   "127.0.0.1:9050"
-    printf "    %-18s %s\n" "Control" "127.0.0.1:9051"
+    printf "    %-18s %s\n" "Tor service" "active"
+    printf "    %-18s %s\n" "Enabled"     "$(tor_enabled && echo enabled || echo disabled)"
+    printf "    %-18s %s\n" "SOCKS"       "127.0.0.1:9050"
+    printf "    %-18s %s\n" "Control"     "127.0.0.1:9051"
     listening 9050 || true
     listening 9051 || true
     tor_check
+    # inline tor speed
+    local tres tdl tul; tres="$(tor_speed_5s)"; tdl="${tres%%|*}"; tul="${tres##*|}"
+    printf "    %-18s ↓ %s   ↑ %s\n" "Tor speed" "$tdl" "$tul"
   else
-    printf "    %-18s %s\n" "Tor" "not active"
+    printf "    %-18s %s\n" "Tor service" "not active"
   fi
 
   print_dns
@@ -261,16 +262,13 @@ print_status(){
   info "Interfaces"
   local def ifc
   def="$(default_dev || true)"
-  # Show default first if available
-  if [[ -n "$def" ]]; then iface_block "$def"; print; fi
-  # Then show the rest (always lists all non-lo, even if disconnected)
+  if [[ -n "$def" ]]; then { iface_block "$def" || warn "could not render $def"; } ; print; fi
   for ifc in $(list_ifaces); do
     [[ "$ifc" == "$def" ]] && continue
-    iface_block "$ifc"; print
+    { iface_block "$ifc" || warn "could not render $ifc"; } ; print
   done
 
   info "Network speed"
-  # pick default IF or first UP IF with IPv4
   local test_if=""
   if [[ -n "$def" && -n "$(iface_ipv4 "$def")" ]]; then
     test_if="$def"
@@ -285,14 +283,6 @@ print_status(){
     printf "      %-16s ↓ %s   ↑ %s\n" "$test_if" "$dl" "$ul"
   else
     printf "      %s\n" "No active interface with IP — skipping."
-  fi
-
-  info "Tor network speed"
-  if tor_active && socks_listening; then
-    local tres tdl tul; tres="$(tor_speed_5s)"; tdl="${tres%%|*}"; tul="${tres##*|}"
-    printf "      %-16s ↓ %s   ↑ %s\n" "via Tor" "$tdl" "$tul"
-  else
-    printf "      %s\n" "Tor not active"
   fi
 
   ok "Status captured."
@@ -368,7 +358,7 @@ case "${1:-}" in
     print -P "%F{yellow}Usage:%f net-toggle {on|off|status}"
     print "  on     : NM-first bring-up (unblock radios, NM up, Ethernet→Wi-Fi)"
     print "  off    : ultra-secure: NM disconnect, links down, PERSISTENT rfkill (wifi/wwan/bt)"
-    print "  status : full network details; default IF first; 5s speed test; Tor info/speed if active"
+    print "  status : full network details; default IF first; 5s speed test; Tor inline section"
     exit 2
     ;;
 esac
