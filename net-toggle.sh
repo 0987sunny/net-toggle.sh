@@ -1,10 +1,10 @@
 #!/usr/bin/env zsh
-# v 3.0 yuriy edition
+# v 3.1 yuriy edition
 # net-toggle — NM-first network controller + full status (zsh)
 # on     : bring networking up via NetworkManager (Ethernet→Wi-Fi). Clears persistent rfkill.
 # off    : ultra-secure: NM disconnect, links down, PERSISTENT rfkill (wifi/wwan/bt). Then shows status.
 # status : full status; default IF first; 5s DL/UL speed for active IF; Tor status always shown (with Tor speed if active).
-SCRIPT_VER="2025-09-11.3"
+SCRIPT_VER="2025-09-11.3.1"
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -17,8 +17,8 @@ typeset -a PREFERRED_SSIDS=( )
 : ${SPEEDTEST_TIMEOUT_SEC:=30}
 
 # Tor speed test endpoints (only if tor is active)
-: ${TOR_DL_URL:=https://speed.hetzner.de/100MB.bin}
-: ${TOR_UL_URL:=https://speed.hetzner.de/upload.php}
+: ${TOR_DL_URL:=http://speed.hetzner.de/100MB.bin} # Using HTTP for Tor speed test
+: ${TOR_UL_URL:=http://speed.hetzner.de/upload.php} # Using HTTP for Tor speed test
 : ${TOR_TEST_SECS:=5}
 
 # ---------------- UI ----------------
@@ -199,7 +199,7 @@ socks_listening(){ ss -lnH 'sport = :9050' 2>/dev/null | grep -q .; }
 listening(){ ss -lnH "sport = :$1" 2>/dev/null | awk '{print "    "$1,$4}'; }
 tor_check(){
   if ! command -v curl &>/dev/null; then printf "    %-18s %s\n" "Tor check" "curl not installed"; return; fi
-  local out; out=$(timeout 8s curl -s --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip 2>/dev/null) || true
+  local out; out=$(timeout 8s curl -s --socks5-hostname 127.0.0.1:9050 http://check.torproject.org/api/ip 2>/dev/null) || true
   if [[ -z "$out" ]]; then printf "    %-18s %s\n" "Tor check" "no response"; return; fi
   local is_tor ip; is_tor=$(printf "%s" "$out" | grep -q '"IsTor":[ ]*true' && echo true || echo false)
   ip=$(printf "%s" "$out" | grep -o '"IP":"[^"]*"' | cut -d\" -f4)
@@ -207,14 +207,32 @@ tor_check(){
 }
 tor_speed_5s(){
   command -v curl &>/dev/null || { echo "—|—"; return 0; }
-  local w_dl bytes_dl t_dl w_ul bytes_ul t_ul dl ul
-  w_dl=$(curl -sS --socks5-hostname 127.0.0.1:9050 -o /dev/null --max-time $((TOR_TEST_SECS+2)) -w '%{size_download} %{time_total}' "$TOR_DL_URL" 2>/dev/null) || true
-  bytes_dl=$(cut -d' ' -f1 <<<"$w_dl" 2>/dev/null || echo 0); t_dl=$(cut -d' ' -f2 <<<"$w_dl" 2>/dev/null || echo 0)
-  w_ul=$(head -c 8388608 /dev/urandom | curl -sS --socks5-hostname 127.0.0.1:9050 -X POST --data-binary @- --max-time $((TOR_TEST_SECS+2)) -o /dev/null -w '%{size_upload} %{time_total}' "$TOR_UL_URL" 2>/dev/null) || true
-  bytes_ul=$(cut -d' ' -f1 <<<"$w_ul" 2>/dev/null || echo 0); t_ul=$(cut -d' ' -f2 <<<"$w_ul" 2>/dev/null || echo 0)
-  if [[ "$bytes_dl" -gt 0 && "$t_dl" != "0" ]]; then dl=$(awk -v b="$bytes_dl" -v t="$t_dl" 'BEGIN{printf "%.1f Mb/s",(b*8)/(t*1e6)}'); fi
-  if [[ "$bytes_ul" -gt 0 && "$t_ul" != "0" ]]; then ul=$(awk -v b="$bytes_ul" -v t="$t_ul" 'BEGIN{printf "%.1f Mb/s",(b*8)/(t*1e6)}'); fi
-  echo "${dl:-—}|${ul:-—}"
+  local -A times
+  typeset -a endpoints
+  endpoints=( "${TOR_DL_URL}" "${TOR_UL_URL}" )
+  
+  for url in "${endpoints[@]}"; do
+    local -A result
+    if [[ "${url}" == *upload.php* ]]; then
+        result[type]="ul"
+        local payload; payload=$(head -c 8388608 /dev/urandom)
+        out=$(timeout $((TOR_TEST_SECS+2)) curl -sS --socks5-hostname 127.0.0.1:9050 -X POST --data-binary "${payload}" --max-time $((TOR_TEST_SECS+2)) -o /dev/null -w '%{size_upload}:%{time_total}' "${url}" 2>/dev/null) || true
+    else
+        result[type]="dl"
+        out=$(timeout $((TOR_TEST_SECS+2)) curl -sS --socks5-hostname 127.0.0.1:9050 -o /dev/null --max-time $((TOR_TEST_SECS+2)) -w '%{size_download}:%{time_total}' "${url}" 2>/dev/null) || true
+    fi
+
+    local bytes_transfered="${out%%:*}"
+    local total_time="${out##*:}"
+
+    if [[ "$bytes_transfered" -gt 0 && "$total_time" != "0" ]]; then
+      local speed_mbps=$(awk -v b="$bytes_transfered" -v t="$total_time" 'BEGIN{printf "%.1f", (b*8)/(t*1e6)}' || echo 0)
+      times["$result[type]"]="${speed_mbps} Mb/s"
+    else
+      times["$result[type]"]="—"
+    fi
+  done
+  echo "${times[dl]:-—}|${times[ul]:-—}"
 }
 
 # ---------------- STATUS VIEW ----------------
