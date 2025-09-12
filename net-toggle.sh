@@ -1,10 +1,10 @@
 #!/usr/bin/env zsh
-# v 3.6 yuriy edition
+# v 3.7 yuriy edition
 # net-toggle — NM-first network controller + full status (zsh)
 # on     : bring networking up via NetworkManager (Ethernet→Wi-Fi). Clears persistent rfkill.
 # off    : ultra-secure: NM disconnect, links down, PERSISTENT rfkill (wifi/wwan/bt). Then shows status.
 # status : full status; default IF first; 5s DL/UL speed for active IF; Tor status always shown (with Tor speed if active).
-SCRIPT_VER="2025-09-11.3.6"
+SCRIPT_VER="2025-09-11.3.7"
 
 set -Eeuo pipefail
 IFS=$'\n\t'
