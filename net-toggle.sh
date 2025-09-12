@@ -1,5 +1,5 @@
 #!/usr/bin/env zsh
-# v 3.2 yuriy edition
+# v 3.3 yuriy edition
 # net-toggle — NM-first network controller + full status (zsh)
 # on     : bring networking up via NetworkManager (Ethernet→Wi-Fi). Clears persistent rfkill.
 # off    : ultra-secure: NM disconnect, links down, PERSISTENT rfkill (wifi/wwan/bt). Then shows status.
@@ -25,7 +25,7 @@ typeset -a PREFERRED_SSIDS=( )
 autoload -Uz colors && colors || true
 ok()   { print -P "%F{green}[✓]%f $*"; }
 warn() { print -P "%F{yellow}[!]%f $*"; }
-err()  { print -P "%F{red}[✗]%f $*" >&2; }
+err()  { print -P "%F{red}[✗}%f $*" >&2; }
 info() { print -P "%F{cyan}[*]%f $*"; }
 
 banner(){
@@ -216,7 +216,7 @@ tor_speed_30s(){
   dl_raw=$(print -r -- "$out" | awk '{print $1}')
   dl_time=$(print -r -- "$out" | awk '{print $2}')
   
-  if [[ "$dl_raw" -gt 0 && "$dl_time" != "0" ]]; then
+  if [[ "$dl_raw" =~ '^[0-9]+$' ]] && [[ "$dl_time" =~ '^[0-9.]+$' ]]; then
     dl=$(awk -v b="$dl_raw" -v t="$dl_time" 'BEGIN{printf "%.1f Mb/s", (b*8)/(t*1e6)}')
   else
     dl="Failed (DL)"
@@ -227,7 +227,7 @@ tor_speed_30s(){
   ul_raw=$(print -r -- "$out" | awk '{print $1}')
   ul_time=$(print -r -- "$out" | awk '{print $2}')
 
-  if [[ "$ul_raw" -gt 0 && "$ul_time" != "0" ]]; then
+  if [[ "$ul_raw" =~ '^[0-9]+$' ]] && [[ "$ul_time" =~ '^[0-9.]+$' ]]; then
     ul=$(awk -v b="$ul_raw" -v t="$ul_time" 'BEGIN{printf "%.1f Mb/s", (b*8)/(t*1e6)}')
   else
     ul="Failed (UL)"
