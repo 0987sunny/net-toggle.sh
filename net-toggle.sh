@@ -1,10 +1,10 @@
 #!/usr/bin/env zsh
-# v 3.7 yuriy edition
+# v 3.8 yuriy edition
 # net-toggle — NM-first network controller + full status (zsh)
 # on     : bring networking up via NetworkManager (Ethernet→Wi-Fi). Clears persistent rfkill.
 # off    : ultra-secure: NM disconnect, links down, PERSISTENT rfkill (wifi/wwan/bt). Then shows status.
 # status : full status; default IF first; 5s DL/UL speed for active IF; Tor status always shown (with Tor speed if active).
-SCRIPT_VER="2025-09-11.3.7"
+SCRIPT_VER="2025-09-11.3.8"
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -199,10 +199,12 @@ socks_listening(){ ss -lnH 'sport = :9050' 2>/dev/null | grep -q .; }
 listening(){
   local port="$1"
   local output
-  output=$(ss -lnH "sport = :${port}" 2>/dev/null || true)
+  output=$(ss -lnH "sport = :${port}" 2>/dev/null)
   if [[ -n "$output" ]]; then
     echo "    $output"
+    return 0 # Explicitly return success
   fi
+  return 1 # Explicitly return failure if nothing is found
 }
 tor_check(){
   if ! command -v curl &>/dev/null; then printf "    %-18s %s\n" "Tor check" "curl not installed"; return; fi
@@ -266,8 +268,8 @@ print_status(){
     printf "    %-18s %s\n" "Enabled"     "$(tor_enabled && echo enabled || echo disabled)"
     printf "    %-18s %s\n" "SOCKS"       "127.0.0.1:9050"
     printf "    %-18s %s\n" "Control"     "127.0.0.1:9051"
-    listening 9050
-    listening 9051
+    listening 9050 || true
+    listening 9051 || true
     tor_check
     # inline tor speed
     local tres tdl tul; tres="$(tor_speed_5s)"; tdl="${tres%%|*}"; tul="${tres##*|}"
