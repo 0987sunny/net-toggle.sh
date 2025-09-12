@@ -1,10 +1,10 @@
 #!/usr/bin/env zsh
-# v 3.9 yuriy edition
+# v 3.0 yuriy edition
 # net-toggle — NM-first network controller + full status (zsh)
 # on     : bring networking up via NetworkManager (Ethernet→Wi-Fi). Clears persistent rfkill.
 # off    : ultra-secure: NM disconnect, links down, PERSISTENT rfkill (wifi/wwan/bt). Then shows status.
 # status : full status; default IF first; 5s DL/UL speed for active IF; Tor status always shown (with Tor speed if active).
-SCRIPT_VER="2025-09-11.3.9"
+SCRIPT_VER="2025-09-11.3"
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -17,14 +17,14 @@ typeset -a PREFERRED_SSIDS=( )
 : ${SPEEDTEST_TIMEOUT_SEC:=30}
 
 # Tor speed test endpoints (only if tor is active)
-: ${TOR_DL_URL:=http://speed.hetzner.de/100MB.bin} # Using HTTP for Tor speed test
-: ${TOR_UL_URL:=http://speed.hetzner.de/upload.php} # Using HTTP for Tor speed test
+: ${TOR_DL_URL:=https://speed.hetzner.de/100MB.bin}
+: ${TOR_UL_URL:=https://speed.hetzner.de/upload.php}
 : ${TOR_TEST_SECS:=5}
 
 # ---------------- UI ----------------
 autoload -Uz colors && colors || true
 ok()   { print -P "%F{green}[✓]%f $*"; }
-warn() { print -P "%F{yellow}[!]%f $*" >&2; }
+warn() { print -P "%F{yellow}[!]%f $*"; }
 err()  { print -P "%F{red}[✗]%f $*" >&2; }
 info() { print -P "%F{cyan}[*]%f $*"; }
 
@@ -196,19 +196,10 @@ speedtest_iface_best(){
 tor_active(){ systemctl is-active --quiet tor; }
 tor_enabled(){ systemctl is-enabled --quiet tor 2>/dev/null; }
 socks_listening(){ ss -lnH 'sport = :9050' 2>/dev/null | grep -q .; }
-listening(){
-  local port="$1"
-  local output
-  output=$(ss -lnH "sport = :${port}" 2>/dev/null || true)
-  if [[ -n "$output" ]]; then
-    echo "    $output"
-    return 0
-  fi
-  return 1
-}
+listening(){ ss -lnH "sport = :$1" 2>/dev/null | awk '{print "    "$1,$4}'; }
 tor_check(){
   if ! command -v curl &>/dev/null; then printf "    %-18s %s\n" "Tor check" "curl not installed"; return; fi
-  local out; out=$(timeout 8s curl -s --socks5-hostname 127.0.0.1:9050 http://check.torproject.org/api/ip 2>/dev/null) || true
+  local out; out=$(timeout 8s curl -s --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip 2>/dev/null) || true
   if [[ -z "$out" ]]; then printf "    %-18s %s\n" "Tor check" "no response"; return; fi
   local is_tor ip; is_tor=$(printf "%s" "$out" | grep -q '"IsTor":[ ]*true' && echo true || echo false)
   ip=$(printf "%s" "$out" | grep -o '"IP":"[^"]*"' | cut -d\" -f4)
@@ -216,32 +207,14 @@ tor_check(){
 }
 tor_speed_5s(){
   command -v curl &>/dev/null || { echo "—|—"; return 0; }
-  local -A times
-  local out bytes_transfered total_time dl_speed ul_speed
-  
-  # Download test
-  out=$(timeout $((TOR_TEST_SECS+2)) curl -sS --socks5-hostname 127.0.0.1:9050 -o /dev/null --max-time $((TOR_TEST_SECS+2)) -w '%{size_download}:%{time_total}' "${TOR_DL_URL}" 2>/dev/null) || true
-  bytes_transfered="${out%%:*}"
-  total_time="${out##*:}"
-  if [[ -n "$bytes_transfered" && "$bytes_transfered" -gt 0 && "$total_time" != "0" ]]; then
-      dl_speed=$(awk -v b="$bytes_transfered" -v t="$total_time" 'BEGIN{printf "%.1f Mb/s",(b*8)/(t*1e6)}' || echo 0)
-      times[dl]="${dl_speed}"
-  else
-      times[dl]="—"
-  fi
-  
-  # Upload test
-  out=$(timeout $((TOR_TEST_SECS+2)) curl -sS --socks5-hostname 127.0.0.1:9050 -X POST --data-binary @/dev/zero --max-time $((TOR_TEST_SECS+2)) -o /dev/null -w '%{size_upload}:%{time_total}' "${TOR_UL_URL}" 2>/dev/null) || true
-  bytes_transfered="${out%%:*}"
-  total_time="${out##*:}"
-  if [[ -n "$bytes_transfered" && "$bytes_transfered" -gt 0 && "$total_time" != "0" ]]; then
-      ul_speed=$(awk -v b="$bytes_transfered" -v t="$total_time" 'BEGIN{printf "%.1f Mb/s",(b*8)/(t*1e6)}' || echo 0)
-      times[ul]="${ul_speed}"
-  else
-      times[ul]="—"
-  fi
-  
-  echo "${times[dl]:-—}|${times[ul]:-—}"
+  local w_dl bytes_dl t_dl w_ul bytes_ul t_ul dl ul
+  w_dl=$(curl -sS --socks5-hostname 127.0.0.1:9050 -o /dev/null --max-time $((TOR_TEST_SECS+2)) -w '%{size_download} %{time_total}' "$TOR_DL_URL" 2>/dev/null) || true
+  bytes_dl=$(cut -d' ' -f1 <<<"$w_dl" 2>/dev/null || echo 0); t_dl=$(cut -d' ' -f2 <<<"$w_dl" 2>/dev/null || echo 0)
+  w_ul=$(head -c 8388608 /dev/urandom | curl -sS --socks5-hostname 127.0.0.1:9050 -X POST --data-binary @- --max-time $((TOR_TEST_SECS+2)) -o /dev/null -w '%{size_upload} %{time_total}' "$TOR_UL_URL" 2>/dev/null) || true
+  bytes_ul=$(cut -d' ' -f1 <<<"$w_ul" 2>/dev/null || echo 0); t_ul=$(cut -d' ' -f2 <<<"$w_ul" 2>/dev/null || echo 0)
+  if [[ "$bytes_dl" -gt 0 && "$t_dl" != "0" ]]; then dl=$(awk -v b="$bytes_dl" -v t="$t_dl" 'BEGIN{printf "%.1f Mb/s",(b*8)/(t*1e6)}'); fi
+  if [[ "$bytes_ul" -gt 0 && "$t_ul" != "0" ]]; then ul=$(awk -v b="$bytes_ul" -v t="$t_ul" 'BEGIN{printf "%.1f Mb/s",(b*8)/(t*1e6)}'); fi
+  echo "${dl:-—}|${ul:-—}"
 }
 
 # ---------------- STATUS VIEW ----------------
