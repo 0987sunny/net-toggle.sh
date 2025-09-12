@@ -1,5 +1,5 @@
 #!/usr/bin/env zsh
-# v 3.0 yuriy edition
+# v 3.1 yuriy edition
 # net-toggle — NM-first network controller + full status (zsh)
 # on     : bring networking up via NetworkManager (Ethernet→Wi-Fi). Clears persistent rfkill.
 # off    : ultra-secure: NM disconnect, links down, PERSISTENT rfkill (wifi/wwan/bt). Then shows status.
