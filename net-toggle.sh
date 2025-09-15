@@ -1,5 +1,5 @@
 #!/usr/bin/env zsh
-# v 3.3 yuriy edition
+# v 3.4 yuriy edition
 # net-toggle — NM-first network controller + full status (zsh)
 # on     : bring networking up via NetworkManager (Ethernet→Wi-Fi). Clears persistent rfkill.
 # off    : ultra-secure: NM disconnect, links down, PERSISTENT rfkill (wifi/wwan/bt). Then shows status.
@@ -128,13 +128,14 @@ net_basics(){
 iface_block(){
   local ifc="$1" type="ethernet"
   [[ "$ifc" == wl* || "$ifc" == wlan* ]] && type="wifi"
-  local ip4 ip6 state ssid="" rate=""
+  local ip4 ip6 state ssid="" rate="" signal_strength=""
   ip4="$(iface_ipv4 "$ifc" || true)"
   ip6="$(iface_ipv6_all "$ifc" || true)"
   state="$(</sys/class/net/"$ifc"/operstate 2>/dev/null || echo down)"
   if [[ "$type" == "wifi" ]] && command -v nmcli &>/dev/null; then
     ssid="$(nmcli -t -f GENERAL.CONNECTION dev show "$ifc" 2>/dev/null | awk -F: '{print $2}')"
     rate="$(nmcli -t -f WIFI.BITRATE dev show "$ifc" 2>/dev/null | awk -F: '{print $2}')"
+    signal_strength="$(nmcli -t -f WIFI.SIGNAL dev show "$ifc" 2>/dev/null | awk -F: '{print $2}' | xargs echo -n)"
   fi
   [[ -z "$rate" ]] && rate="$(iw dev "$ifc" link 2>/dev/null | awk -F': ' '/tx bitrate/{print $2 " (iw)"}')"
   if [[ "$type" == "ethernet" && -r /sys/class/net/$ifc/speed ]]; then
@@ -145,6 +146,7 @@ iface_block(){
   printf "    %-18s %s\n" "State"     "$state"
   [[ -n "$ssid" ]] && printf "    %-18s %s\n" "SSID" "$ssid"
   [[ -n "$rate" ]] && printf "    %-18s %s\n" "Link rate" "$rate"
+  [[ -n "$signal_strength" ]] && printf "    %-18s %s%%\n" "Signal" "$signal_strength"
   printf "    %-18s %s\n" "IPv4" "${ip4:-—}"
   printf "    %-18s %s\n" "IPv6" "${ip6:-—}"
 }
@@ -189,7 +191,7 @@ speedtest_iface_best(){
   if command -v speedtest-cli &>/dev/null; then
     res=$(st_cli_iface "$ifc" || true); [[ -n "$res" ]] && { print -r -- "$res"; return 0; }
   fi
-  echo "No tool|Install iperf3"
+  echo "—|—"
 }
 
 # ---------------- Tor helpers ----------------
@@ -205,41 +207,17 @@ tor_check(){
   ip=$(printf "%s" "$out" | grep -o '"IP":"[^"]*"' | cut -d\" -f4)
   printf "    %-18s %s (IP: %s)\n" "Tor check" "$is_tor" "${ip:-?}"
 }
-tor_speed_30s(){
-  command -v curl &>/dev/null || { echo "—|—"; return 0; }
-
-  local out dl_raw dl_time ul_raw ul_time
-  local dl="—" ul="—"
-
-  # Step 1: Download Test
-  out=$(curl -sS --socks5-hostname 127.0.0.1:9050 -o /dev/null --connect-timeout 20 --max-time $((TOR_TEST_SECS+5)) -w '%{size_download} %{time_total}' "$TOR_DL_URL" 2>&1 || true)
-  dl_raw=$(print -r -- "$out" | awk '{print $1}')
-  dl_time=$(print -r -- "$out" | awk '{print $2}')
-  
-  if [[ "$dl_raw" =~ '^[0-9]+$' ]] && [[ "$dl_time" =~ '^[0-9.]+$' ]]; then
-    dl=$(awk -v b="$dl_raw" -v t="$dl_time" 'BEGIN{printf "%.1f Mb/s", (b*8)/(t*1e6)}')
-  else
-    dl="Failed (DL)"
-  fi
-
-  # Step 2: Upload Test
-  out=$(head -c 8388608 /dev/urandom | curl -sS --socks5-hostname 127.0.0.1:9050 -X POST --data-binary @- --connect-timeout 20 --max-time $((TOR_TEST_SECS+5)) -o /dev/null -w '%{size_upload} %{time_total}' "$TOR_UL_URL" 2>&1 || true)
-  ul_raw=$(print -r -- "$out" | awk '{print $1}')
-  ul_time=$(print -r -- "$out" | awk '{print $2}')
-
-  if [[ "$ul_raw" =~ '^[0-9]+$' ]] && [[ "$ul_time" =~ '^[0-9.]+$' ]]; then
-    ul=$(awk -v b="$ul_raw" -v t="$ul_time" 'BEGIN{printf "%.1f Mb/s", (b*8)/(t*1e6)}')
-  else
-    ul="Failed (UL)"
-  fi
-  
-  echo "${dl:-—}|${ul:-—}"
-}
 
 # ---------------- STATUS VIEW ----------------
 print_status(){
   clear; banner
   print -P "%F{green}[i]%f archcrypt Network Details -"
+  print
+
+  info "System Information"
+  printf "    %-18s %s\n" "Kernel" "$(uname -r)"
+  printf "    %-18s %s\n" "Hostname" "$(hostname -s)"
+  printf "    %-18s %s\n" "Arch Linux" "256 GB USB"
   print
 
   if command -v nmcli &>/dev/null; then
@@ -263,9 +241,6 @@ print_status(){
     listening 9050 || true
     listening 9051 || true
     tor_check
-    # inline tor speed
-    local tres tdl tul; tres="$(tor_speed_30s)"; tdl="${tres%%|*}"; tul="${tres##*|}"
-    printf "    %-18s ↓ %s   ↑ %s\n" "Tor speed" "$tdl" "$tul"
   else
     printf "    %-18s %s\n" "Tor service" "not active"
   fi
@@ -293,7 +268,11 @@ print_status(){
   if [[ -n "$test_if" ]]; then
     local res dl ul; res="$(speedtest_iface_best "$test_if")"
     dl="${res%%|*}"; ul="${res##*|}"
-    printf "      %-16s ↓ %s   ↑ %s\n" "$test_if" "$dl" "$ul"
+    if [[ "$res" == "—|—" ]]; then
+      warn "No speed test tool found. Install iperf3, speedtest (ookla), or speedtest-cli."
+    else
+      printf "      %-16s ↓ %s   ↑ %s\n" "$test_if" "$dl" "$ul"
+    fi
   else
     printf "      %s\n" "No active interface with IP — skipping."
   fi
